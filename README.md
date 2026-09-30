@@ -26,6 +26,15 @@ TSE ──GET──▶ Lambda coletor-tse ──PutObject──▶ S3 raw-tse-da
 - `template.yaml` — toda a infraestrutura (CloudFormation)
 - `notificador/index.py` — repassa os alarmes para o Telegram
 - `deploy.sh` — publica infraestrutura e código
+- `tests/` — testes unitários do coletor e do notificador (não vão para o zip da Lambda)
+
+## Testes
+
+Rodam com o Python puro, sem AWS nem `boto3` instalado (o boto3 é trocado por mocks):
+
+```bash
+python3 -m unittest discover -s tests -v
+```
 
 ## Diferenças em relação à versão GCP
 
@@ -34,11 +43,13 @@ Já incorpora as correções da análise técnica:
 - **Falha de download de um cargo não some com ele do índice** — o item anterior é mantido.
 - **Execuções sobrepostas são bloqueadas** por um lock no S3 (`_controle/coletor.lock`, escrita condicional). Lock com mais de 180s é considerado abandonado.
 - **Retry com backoff** (3 tentativas) em timeout, erro de rede, HTTP 429/5xx e JSON incompleto do TSE.
+- **Retry limitado ao tempo da execução** — com o TSE lento, as tentativas somadas passariam do timeout de 120s; a Lambda morreria sem liberar o lock e as execuções seguintes seriam puladas por até 3 min. Agora o timeout de cada requisição encolhe para caber no tempo restante (menos `MARGEM_SEGUNDOS`, padrão 10s, reservados para o S3 e o lock) e não há nova tentativa sem tempo. O cargo que não coube vira falha parcial (`erro_motivo`: *acabou o tempo da execução*).
+- **Cargos baixados em paralelo** (`DOWNLOADS_PARALELOS`, padrão 5) — a execução leva o tempo do cargo mais lento, não a soma. Gravação no S3 e ordem do índice continuam em série.
 - **`ele-c.json` em cache por 1h** (`CONFIG_TTL_SEGUNDOS`) — em vez de 1440 requisições/dia ao TSE, ~24. Ordem: memória da Lambda quente → cópia em `_controle/config-<TseAmbiente>.json` no S3 (vale após cold start; guarda a URL de origem, então trocar `TseBaseUrl` não reaproveita a cópia) → TSE. Se o TSE falhar ao renovar, usa a cópia antiga (WARNING `TSE indisponível para o ele-c.json ... usando cópia`) em vez de parar a coleta. Se a cópia não tiver eleição do `TseTurno` configurado (ex.: troca para o 2º turno), busca no TSE na hora. Para forçar a renovação: apague o arquivo em `_controle/` e rode `aws/deploy.sh`.
 - **Erro ao gravar um cargo no S3 não derruba a coleta** — conta como falha daquele cargo (item anterior mantido).
 - **Falha total vira erro da Lambda** (config do TSE indisponível ou nenhum cargo coletado), o que dispara o alarme `coletor-tse-erros`. Falha parcial retorna `status: partial` e loga `WARNING`.
 - **Logs em JSON com nível** — dá para filtrar por `ERROR`/`WARNING` de verdade. Todo erro traz `erro_etapa`, `erro_tipo`, `erro_cargo` e `erro_motivo` (em português), que o notificador usa para explicar o alarme no Telegram.
-- **`TSE_TURNO` é usado**: só coleta eleições cujo campo `t` do `ele-c.json` bate com o turno.
+- **`TSE_TURNO` é usado**: só coleta eleições cujo campo `t` do `ele-c.json` bate com o turno. Turno e códigos de eleição/cargo são comparados como texto, então funcionam se o TSE mandar número ou string.
 - `Cache-Control: public, max-age=0, s-maxage=30, stale-while-revalidate=60`.
 
 ## Deploy

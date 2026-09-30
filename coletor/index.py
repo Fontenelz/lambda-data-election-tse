@@ -6,6 +6,7 @@ import urllib.error
 import urllib.request
 import uuid
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 
 import boto3
@@ -16,7 +17,10 @@ from botocore.exceptions import BotoCoreError, ClientError
 # e já incorpora as correções apontadas na análise técnica:
 #  - falha de download/gravação de um cargo mantém o item anterior no índice
 #  - lock no S3 (escrita condicional) impede execuções sobrepostas
-#  - retry com backoff nas chamadas ao TSE (inclusive JSON incompleto)
+#  - retry com backoff nas chamadas ao TSE (inclusive JSON incompleto),
+#    limitado ao tempo que resta da execução — a função termina sozinha
+#    (e libera o lock) em vez de estourar o timeout com o TSE lento
+#  - cargos baixados em paralelo
 #  - falha total (config, coleta vazia, índice) vira erro da função -> alarme
 #  - logging com nível (formato JSON da Lambda), filtrável por ERROR/WARNING;
 #    erros levam erro_tipo/erro_etapa/erro_cargo/erro_motivo, que o
@@ -28,7 +32,7 @@ logger.setLevel(os.environ.get("LOG_LEVEL", "INFO"))
 # --- Configuração ---
 TSE_BASE_URL = os.environ.get("TSE_BASE_URL", "https://resultados-sim.tse.jus.br/simulado")
 AMBIENTE = os.environ.get("TSE_AMBIENTE", "simulado2026")
-TURNO = os.environ.get("TSE_TURNO", "1")
+TURNO = os.environ.get("TSE_TURNO", "1").strip()
 UF = os.environ.get("TSE_UF", "ma").lower()
 
 BUCKET_NAME = os.environ["BUCKET_NAME"]
@@ -47,6 +51,11 @@ CONFIG_CACHE_KEY = f"_controle/config-{AMBIENTE}.json"
 
 HTTP_TIMEOUT = int(os.environ.get("HTTP_TIMEOUT", "15"))
 HTTP_TENTATIVAS = int(os.environ.get("HTTP_TENTATIVAS", "3"))
+# não começa uma requisição com menos que isso de prazo (não daria tempo)
+HTTP_TIMEOUT_MINIMO = float(os.environ.get("HTTP_TIMEOUT_MINIMO", "2"))
+# tempo reservado no fim da execução para gravar no S3 e liberar o lock
+MARGEM_SEGUNDOS = float(os.environ.get("MARGEM_SEGUNDOS", "10"))
+DOWNLOADS_PARALELOS = int(os.environ.get("DOWNLOADS_PARALELOS", "5"))
 
 CARGOS_FEDERAIS = {"1"}  # presidente -> pasta "br"
 CARGOS_ESTADUAIS = {"3", "5", "6", "7"}  # governador, senador, dep. federal, dep. estadual -> pasta = TSE_UF
@@ -62,6 +71,11 @@ HEADERS = {
 }
 
 s3 = boto3.client("s3")
+
+
+class PrazoEsgotado(TimeoutError):
+    # sem tempo para (mais) uma requisição antes do timeout da função
+    pass
 
 
 class ColetaFalhou(Exception):
@@ -84,6 +98,8 @@ def descrever_erro(error):
         if error.code >= 500:
             return "tse_indisponivel", f"TSE instável (HTTP {error.code})"
         return "tse_nao_encontrado", f"TSE recusou a requisição (HTTP {error.code})"
+    if isinstance(error, PrazoEsgotado):
+        return "tse_indisponivel", "TSE lento demais: acabou o tempo da execução antes de concluir o download"
     if isinstance(error, TimeoutError) or (
         isinstance(error, urllib.error.URLError) and isinstance(error.reason, TimeoutError)
     ):
@@ -116,14 +132,23 @@ def registrar_erro(etapa, tipo, motivo, cargo=None, url=None, fatal=False):
     logger.error("%s%s: %s", etapa, f" [{cargo}]" if cargo else "", motivo, extra=extra)
 
 
-def baixar_json(url):
+def baixar_json(url, prazo=None):
     # Retorna (dados_parseados, conteudo_bruto). Tenta de novo em timeout,
     # erro de rede, HTTP 429/5xx e JSON incompleto (arquivo lido no meio da
-    # publicação); 404 e afins falham na hora (não adianta).
+    # publicação); 404 e afins falham na hora (não adianta). `prazo` é o
+    # instante (time.monotonic) em que é preciso parar: o timeout de cada
+    # tentativa encolhe para caber nele e não há nova tentativa sem tempo.
+    ultimo_erro = None
     for tentativa in range(1, HTTP_TENTATIVAS + 1):
+        timeout = HTTP_TIMEOUT
+        if prazo is not None:
+            restante = prazo - time.monotonic()
+            if restante < HTTP_TIMEOUT_MINIMO:
+                raise PrazoEsgotado(f"sem tempo para baixar {url}") from ultimo_erro
+            timeout = min(HTTP_TIMEOUT, restante)
         try:
             request = urllib.request.Request(url, headers=HEADERS)
-            with urllib.request.urlopen(request, timeout=HTTP_TIMEOUT) as response:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
                 content = response.read()
             return json.loads(content.decode("utf-8")), content
         except urllib.error.HTTPError as error:
@@ -135,6 +160,8 @@ def baixar_json(url):
 
         if tentativa < HTTP_TENTATIVAS:
             espera = 2 ** (tentativa - 1)  # 1s, 2s, ...
+            if prazo is not None and prazo - time.monotonic() - espera < HTTP_TIMEOUT_MINIMO:
+                break  # não daria tempo: falha com o erro real, não com PrazoEsgotado
             logger.warning("Tentativa %d/%d falhou para %s: %s — nova tentativa em %ds",
                            tentativa, HTTP_TENTATIVAS, url, descrever_erro(ultimo_erro)[1], espera)
             time.sleep(espera)
@@ -252,7 +279,7 @@ def ler_config_salva(config_url):
         return None
 
 
-def obter_config(config_url, forcar=False):
+def obter_config(config_url, forcar=False, prazo=None):
     # Retorna (config, fonte). Ordem: memória -> cópia no S3 -> TSE. Se o TSE
     # falhar, usa a cópia que houver, mesmo vencida — melhor que parar a coleta.
     global _config_cache
@@ -267,7 +294,7 @@ def obter_config(config_url, forcar=False):
             return salva[0], "cópia no S3"
 
     try:
-        config, conteudo_bruto = baixar_json(config_url)
+        config, conteudo_bruto = baixar_json(config_url, prazo)
     except Exception as error:
         reserva = _config_cache or salva or ler_config_salva(config_url)
         if not reserva:
@@ -290,32 +317,52 @@ def listar_alvos(config):
     # a coletar, filtrando pelo turno configurado.
     for pleito in config.get("pl", []):
         for eleicao in pleito.get("e", []):
-            if eleicao.get("t", TURNO) != TURNO:
+            # str(): o TSE pode mandar o turno como número ou texto
+            if str(eleicao.get("t", TURNO)) != TURNO:
                 continue
 
             # na prática o índice sempre traz abr.cd = "br"; a pasta/UF é
             # decidida pelo código do cargo
             for abrangencia in eleicao.get("abr", []):
                 for cargo in abrangencia.get("cp", []):
-                    if cargo["cd"] in CARGOS_FEDERAIS:
+                    if str(cargo["cd"]) in CARGOS_FEDERAIS:
                         yield pleito, eleicao, cargo, "br", "federal"
-                    elif cargo["cd"] in CARGOS_ESTADUAIS:
+                    elif str(cargo["cd"]) in CARGOS_ESTADUAIS:
                         yield pleito, eleicao, cargo, UF, "estadual"
                     # demais: cargo municipal ou exclusivo do DF - ainda não coberto
 
 
-def coletar():
+def preparar_alvo(ciclo, pleito, eleicao, cargo, uf_pasta, cod_abrangencia):
+    # (item do índice, url no TSE, rótulo para logs/alertas)
+    codigo_eleicao = str(eleicao["cd"])
+    codigo_cargo = str(cargo["cd"])
+    arquivo = f"{uf_pasta}-c{codigo_cargo.zfill(4)}-e{codigo_eleicao.zfill(6)}-u.json"
+    url = f"{TSE_BASE_URL}/{AMBIENTE}/{ciclo}/{codigo_eleicao}/dados/{uf_pasta}/{arquivo}"
+    item = {
+        "pleito": pleito["cd"],
+        "eleicao": codigo_eleicao,
+        "nome_eleicao": eleicao.get("nm", ""),
+        "cargo": codigo_cargo,
+        "nome_cargo": cargo.get("ds", ""),
+        "abrangencia": cod_abrangencia,
+        "arquivo": caminho_espelhado_tse(ciclo, codigo_eleicao, uf_pasta, arquivo),
+    }
+    rotulo = f'{item["nome_cargo"] or "cargo " + item["cargo"]} ({uf_pasta.upper()})'
+    return item, url, rotulo
+
+
+def coletar(prazo=None):
     estado_anterior = carregar_estado_anterior()
 
     # 1. Configuração geral — sem ela não há o que coletar
     config_url = f"{TSE_BASE_URL}/{AMBIENTE}/comum/config/ele-c.json"
     try:
-        config, fonte = obter_config(config_url)
+        config, fonte = obter_config(config_url, prazo=prazo)
         alvos = list(listar_alvos(config))
         if not alvos and fonte != "TSE":
             # cópia antiga pode não ter o turno novo (ex.: troca para o 2º turno)
             logger.info("Configuração em cache sem eleição do turno %s — buscando no TSE", TURNO)
-            config, fonte = obter_config(config_url, forcar=True)
+            config, fonte = obter_config(config_url, forcar=True, prazo=prazo)
             alvos = list(listar_alvos(config))
         ciclo = config["pl"][0]["c"]  # → "ele2026"
     except Exception as error:
@@ -334,28 +381,19 @@ def coletar():
     cargos_com_erro = []
     tipos_de_erro = Counter()
 
-    # 2. Percorre os cargos cobertos
-    for pleito, eleicao, cargo, uf_pasta, cod_abrangencia in alvos:
-        codigo_eleicao = eleicao["cd"]
-        arquivo = f"{uf_pasta}-c{cargo['cd'].zfill(4)}-e{codigo_eleicao.zfill(6)}-u.json"
-        url = f"{TSE_BASE_URL}/{AMBIENTE}/{ciclo}/{codigo_eleicao}/dados/{uf_pasta}/{arquivo}"
+    # 2. Baixa os cargos cobertos em paralelo (só a parte HTTP; S3 e índice
+    # seguem em série, na ordem do ele-c.json)
+    preparados = [preparar_alvo(ciclo, *alvo) for alvo in alvos]
+    for item, url, _ in preparados:
+        logger.info("%s / %s (%s): %s", item["nome_eleicao"], item["nome_cargo"], item["abrangencia"], url)
+    with ThreadPoolExecutor(max_workers=max(1, min(DOWNLOADS_PARALELOS, len(preparados)))) as pool:
+        downloads = [pool.submit(baixar_json, url, prazo) for _, url, _ in preparados]
 
-        item = {
-            "pleito": pleito["cd"],
-            "eleicao": codigo_eleicao,
-            "nome_eleicao": eleicao.get("nm", ""),
-            "cargo": cargo["cd"],
-            "nome_cargo": cargo.get("ds", ""),
-            "abrangencia": cod_abrangencia,
-            "arquivo": caminho_espelhado_tse(ciclo, codigo_eleicao, uf_pasta, arquivo),
-        }
+    for (item, url, rotulo), download in zip(preparados, downloads):
         item_anterior = estado_anterior.get(chave_item(item))
-        rotulo = f'{item["nome_cargo"] or "cargo " + item["cargo"]} ({uf_pasta.upper()})'
-
-        logger.info("%s / %s (%s): %s", item["nome_eleicao"], item["nome_cargo"], cod_abrangencia, url)
 
         try:
-            dados, conteudo_bruto = baixar_json(url)
+            dados, conteudo_bruto = download.result()
         except Exception as error:
             tipo, motivo = descrever_erro(error)
             registrar_erro("download do cargo", tipo, motivo, cargo=rotulo, url=url)
@@ -432,6 +470,10 @@ def lambda_handler(event, context):
     logger.info("Iniciando coletor TSE | Ambiente: %s | Turno: %s | UF: %s", AMBIENTE, TURNO, UF.upper())
 
     dono = getattr(context, "aws_request_id", None) or str(uuid.uuid4())
+    # instante-limite para parar de falar com o TSE, deixando a margem para
+    # gravar no S3 e liberar o lock antes do timeout da função
+    restante_ms = getattr(context, "get_remaining_time_in_millis", None)
+    prazo = time.monotonic() + restante_ms() / 1000 - MARGEM_SEGUNDOS if restante_ms else None
     try:
         conseguiu_lock = adquirir_lock(dono)
     except (ClientError, BotoCoreError) as error:
@@ -443,7 +485,7 @@ def lambda_handler(event, context):
         return {"status": "skipped", "motivo": "coleta em andamento"}
 
     try:
-        resultado = coletar()
+        resultado = coletar(prazo)
     except ColetaFalhou as error:
         registrar_erro(error.etapa, error.tipo, error.motivo, fatal=True)
         raise
