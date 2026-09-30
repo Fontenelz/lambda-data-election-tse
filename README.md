@@ -23,10 +23,11 @@ TSE ──GET──▶ Lambda coletor-tse ──PutObject──▶ S3 raw-tse-da
 ## Arquivos
 
 - `coletor/index.py` — o coletor (sem dependências externas; `boto3` já vem no runtime)
-- `template.yaml` — toda a infraestrutura (CloudFormation)
+- `template.yaml` — toda a infraestrutura (CloudFormation, `sa-east-1`)
+- `template-borda.yaml` — alarmes do CloudFront (stack `coletor-tse-borda` em `us-east-1`, onde ficam as métricas do CloudFront); publicado pelo `deploy.sh`
 - `notificador/index.py` — repassa os alarmes para o Telegram
 - `deploy.sh` — publica infraestrutura e código
-- `tests/` — testes unitários do coletor e do notificador (não vão para o zip da Lambda)
+- `tests/` — testes unitários do coletor, do notificador e da CloudFront Function (esta roda no `node`, se instalado); não vão para o zip da Lambda
 
 ## Testes
 
@@ -55,6 +56,8 @@ Já incorpora as correções da análise técnica:
 ## Deploy
 
 Pré-requisitos: AWS CLI logada e `zip`.
+
+O `deploy.sh` publica dois stacks: `coletor-tse` (`sa-east-1`, recebe os parâmetros abaixo) e depois `coletor-tse-borda` (`us-east-1`, alarmes do CloudFront), que pega distribuição, notificador e `AlertEmail` do primeiro — não precisa passar nada para ele.
 
 ```bash
 aws/deploy.sh                                        # só atualiza código/infra, mantém parâmetros
@@ -99,8 +102,8 @@ Referência rápida (conta `281466185599`, região `sa-east-1`):
 | Lambda | `coletor-tse` |
 | Log group | `/aws/lambda/coletor-tse` (retenção 30 dias) |
 | Agendamento | EventBridge Scheduler `coletor-tse` — `rate(1 minute)` |
-| Alarmes | `coletor-tse-erros`, `coletor-tse-dados-parados` |
-| Tópico de alertas | SNS `coletor-tse-alertas` |
+| Alarmes | `coletor-tse-erros`, `coletor-tse-dados-parados` (`sa-east-1`); `coletor-tse-cloudfront-4xx`, `coletor-tse-cloudfront-5xx` (`us-east-1`, stack `coletor-tse-borda`) |
+| Tópico de alertas | SNS `coletor-tse-alertas` (`sa-east-1`) e `coletor-tse-alertas-cloudfront` (`us-east-1`) — os dois acionam o mesmo notificador |
 | Métrica customizada | `ColetorTSE/ColetasCompletas` |
 | Notificador | Lambda `coletor-tse-telegram` (só com Telegram configurado) |
 | Bucket | `raw-tse-data-2026` |
@@ -180,7 +183,16 @@ Parâmetros atuais (ambiente TSE, turno, UF, frequência, origens), outputs e hi
 | `4xxErrorRate` | CloudFront | baixo | Alto → acessos bloqueados (403 da função) ou arquivo inexistente (404) |
 | `CacheHitRate` | CloudFront | alto em pico | Baixo → cabeçalhos de cache errados |
 
-> `CacheHitRate` e os detalhes de 4xx/5xx por código precisam das *additional metrics* do CloudFront habilitadas (custo extra por distribuição).
+> `CacheHitRate` e os detalhes de 4xx/5xx por código vêm das *additional metrics* do CloudFront, habilitadas pelo stack (`MonitoringSubscription`; cobradas como métricas customizadas do CloudWatch).
+
+**Alarmes do CloudFront** (`us-east-1`, janelas de 5 min, ignorados com menos de 100 requisições na janela):
+
+| Alarme | Dispara quando | Causa mais comum |
+|---|---|---|
+| `coletor-tse-cloudfront-4xx` | 4xx > 5% por 10 min | site numa origem fora de `AllowedOrigins` (ex.: `www.`) → 403 da função |
+| `coletor-tse-cloudfront-5xx` | 5xx > 1% em 5 min | S3/OAC ou CloudFront Function com erro |
+
+Limites ajustáveis nos parâmetros `Limite4xxPercent`, `Limite5xxPercent` e `MinimoRequisicoes` de `template-borda.yaml`.
 
 ### Mensagens de log e o que significam
 
@@ -326,7 +338,7 @@ Se a mensagem não chegar, veja os logs de `/aws/lambda/coletor-tse-telegram`. O
 
 ### Pendências de observabilidade
 
-- **Sem logs de acesso do CloudFront** — hoje só métricas agregadas; para ver quem foi bloqueado (403) é preciso habilitar o standard logging.
+- **Sem logs de acesso do CloudFront** — há métricas por código de erro e alarme de 4xx/5xx, mas para ver *quem* foi bloqueado (403) é preciso habilitar o standard logging (configurado a partir de `us-east-1`; caberia no `template-borda.yaml`).
 - **Duração/memória por execução** não aparece nos logs (`SystemLogLevel: WARN` filtra as linhas `REPORT`); use a métrica `Duration`.
 - **Falha do próprio notificador não avisa ninguém** — se o Telegram cair ou o token for revogado, o erro fica só no log do `coletor-tse-telegram`. Vale ter também `AlertEmail` como segundo canal.
 - **TSE parado não é alertado** — se o TSE parar de publicar, o coletor segue "completo". Compare `gerado_em` com o site do TSE durante a apuração.
@@ -334,6 +346,7 @@ Se a mensagem não chegar, veja os logs de `/aws/lambda/coletor-tse-telegram`. O
 ## Remover tudo
 
 ```bash
+aws cloudformation delete-stack --region us-east-1 --stack-name coletor-tse-borda
 aws cloudformation delete-stack --region sa-east-1 --stack-name coletor-tse
 ```
 
@@ -348,7 +361,7 @@ A conta tem limite de 10 execuções concorrentes de Lambda, o que impede usar c
 Somente `https://imirante.com`, `https://m.imirante.com` e `http(s)://homologacao.imirante.com` (parâmetro `AllowedOrigins`; homologação hoje só responde em HTTP), em duas camadas:
 
 1. **CORS** — navegador só entrega a resposta ao JavaScript de páginas do imirante.com.
-2. **CloudFront Function** (`coletor-tse-somente-imirante`) — responde **403** na borda a qualquer requisição cujo `Origin` (ou, na falta dele, `Referer`) não seja uma origem permitida. Abrir a URL direto no navegador, embutir em outro site ou `curl` simples são bloqueados.
+2. **CloudFront Function** (`coletor-tse-somente-imirante`) — responde **403** na borda a qualquer requisição cujo `Origin` (ou, na falta dele, `Referer`) não seja uma origem permitida. Abrir a URL direto no navegador, embutir em outro site ou `curl` simples são bloqueados. Também responde o **preflight CORS** (`OPTIONS`) com 204 para as origens permitidas — o S3 recusaria com 403, e o navegador bloquearia qualquer `fetch()` que mande cabeçalho próprio (ex.: `Cache-Control`).
 
 Cabeçalhos podem ser forjados por scripts, então isso impede uso por outros sites, mas não é autenticação. Para depurar:
 

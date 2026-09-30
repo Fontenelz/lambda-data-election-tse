@@ -74,6 +74,33 @@ class Formatar(unittest.TestCase):
         self.assertIn("Problema durou <b>30 min</b>", texto)
 
 
+class AlarmesCloudFront(unittest.TestCase):
+    ARN = "arn:aws:cloudwatch:us-east-1:123456789012:alarm:coletor-tse-cloudfront-4xx"
+
+    def mensagem(self, estado, anterior="OK"):
+        dados = json.loads(alarme("coletor-tse-cloudfront-4xx", estado, anterior))
+        dados["AlarmArn"] = self.ARN
+        return json.dumps(dados)
+
+    def test_alarm_traz_dica_sem_consultar_logs_do_coletor(self):
+        with mock.patch.object(notificador, "linhas_de_contexto") as contexto:
+            texto = notificador.formatar(self.mensagem("ALARM"))
+        contexto.assert_not_called()
+        self.assertIn("CloudFront recusando requisições", texto)
+        self.assertIn("AllowedOrigins", texto)
+        self.assertIn("Monitoramento do CloudFront", texto)
+        self.assertIn("https://us-east-1.console.aws.amazon.com/cloudwatch/", texto)
+        self.assertNotIn("Logs do coletor", texto)
+
+    def test_ok_busca_historico_na_regiao_do_alarme(self):
+        with mock.patch.object(notificador, "inicio_do_problema", return_value=None) as inicio:
+            notificador.formatar(self.mensagem("OK", anterior="ALARM"))
+        self.assertEqual(inicio.call_args.args[2], "us-east-1")
+
+    def test_regiao_padrao_sem_arn(self):
+        self.assertEqual(notificador.regiao_do_alarme({}), "sa-east-1")
+
+
 class Enviar(unittest.TestCase):
     def setUp(self):
         self.chamar = mock.patch.object(notificador, "chamar_telegram").start()

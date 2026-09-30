@@ -233,7 +233,9 @@ Resources:
                   - !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:${CollectorLogGroup}:*"
               - Effect: Allow
                 Action: cloudwatch:DescribeAlarmHistory
-                Resource: !Sub "arn:${AWS::Partition}:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:coletor-tse-*"
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:coletor-tse-*"
+                  - !Sub "arn:${AWS::Partition}:cloudwatch:us-east-1:${AWS::AccountId}:alarm:coletor-tse-*"
               # GetMetricData não aceita restrição por recurso
               - Effect: Allow
                 Action: cloudwatch:GetMetricData
@@ -273,6 +275,17 @@ Resources:
       Action: lambda:InvokeFunction
       Principal: sns.amazonaws.com
       SourceArn: !Ref AlertTopic
+
+  # tópico dos alarmes do CloudFront, criado por template-borda.yaml em
+  # us-east-1 (as métricas do CloudFront só existem lá); ARN fixo pelo nome
+  NotifierPermissionBorda:
+    Type: AWS::Lambda::Permission
+    Condition: HasTelegram
+    Properties:
+      FunctionName: !Ref NotifierFunction
+      Action: lambda:InvokeFunction
+      Principal: sns.amazonaws.com
+      SourceArn: !Sub "arn:${AWS::Partition}:sns:us-east-1:${AWS::AccountId}:coletor-tse-alertas-cloudfront"
 
   NotifierSubscription:
     Type: AWS::SNS::Subscription
@@ -380,6 +393,8 @@ Resources:
   # não vem do site. fetch() de outro domínio sempre manda Origin; o Referer
   # cobre navegadores que omitem Origin em GET. Cabeçalhos são falsificáveis
   # por scripts — impede uso por outros sites, não é autenticação.
+  # Também responde o preflight (OPTIONS): o S3 sem configuração de CORS
+  # devolve 403 e o navegador bloquearia fetch() com cabeçalhos próprios.
   OriginGuardFunction:
     Type: AWS::CloudFront::Function
     Properties:
@@ -393,7 +408,8 @@ Resources:
           var PERMITIDAS = ['${Lista}'];
 
           function handler(event) {
-              var headers = event.request.headers;
+              var request = event.request;
+              var headers = request.headers;
               var origem = headers.origin && headers.origin.value;
 
               if (!origem && headers.referer) {
@@ -401,10 +417,25 @@ Resources:
                   origem = m && m[0];
               }
 
-              if (origem && PERMITIDAS.indexOf(origem) !== -1) {
-                  return event.request;
+              if (!origem || PERMITIDAS.indexOf(origem) === -1) {
+                  return { statusCode: 403, statusDescription: 'Forbidden' };
               }
-              return { statusCode: 403, statusDescription: 'Forbidden' };
+
+              if (request.method === 'OPTIONS') {
+                  var pedidos = headers['access-control-request-headers'];
+                  return {
+                      statusCode: 204,
+                      statusDescription: 'No Content',
+                      headers: {
+                          'access-control-allow-origin': { value: origem },
+                          'access-control-allow-methods': { value: 'GET, HEAD, OPTIONS' },
+                          'access-control-allow-headers': { value: pedidos ? pedidos.value : '*' },
+                          'access-control-max-age': { value: '600' },
+                          'vary': { value: 'Origin' }
+                      }
+                  };
+              }
+              return request;
           }
         - Lista: !Join ["', '", !Ref AllowedOrigins]
 
@@ -435,6 +466,17 @@ Resources:
           FunctionAssociations:
             - EventType: viewer-request
               FunctionARN: !GetAtt OriginGuardFunction.FunctionMetadata.FunctionARN
+
+  # métricas adicionais (taxa de acerto do cache, 401/403/404/5xx por código,
+  # erros de origem); cobradas como métricas customizadas do CloudWatch.
+  # Os alarmes sobre elas ficam em template-borda.yaml (us-east-1).
+  MonitoringSubscription:
+    Type: AWS::CloudFront::MonitoringSubscription
+    Properties:
+      DistributionId: !Ref Distribution
+      MonitoringSubscription:
+        RealtimeMetricsSubscriptionConfig:
+          RealtimeMetricsSubscriptionStatus: Enabled
 
   # único dono da política do bucket existente (não havia política antes)
   BucketPolicy:
@@ -472,6 +514,9 @@ Outputs:
   NotifierFunctionName:
     Condition: HasTelegram
     Value: !Ref NotifierFunction
+  NotifierFunctionArn:
+    Condition: HasTelegram
+    Value: !GetAtt NotifierFunction.Arn
   AlertTopicArn:
     Value: !Ref AlertTopic
   DistributionDomain:

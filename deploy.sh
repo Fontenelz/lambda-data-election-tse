@@ -41,5 +41,25 @@ if [ -n "$NOTIFIER" ] && [ "$NOTIFIER" != "None" ]; then
   aws lambda wait function-updated-v2 --region "$REGION" --function-name "$NOTIFIER"
 fi
 
+# alarmes do CloudFront: as métricas dele só existem em us-east-1. Parâmetros
+# vêm do stack principal (distribuição, notificador e e-mail de alerta).
+echo "==> Alarmes do CloudFront (stack $STACK-borda em us-east-1)"
+saida() {
+  aws cloudformation describe-stacks --region "$REGION" --stack-name "$STACK" \
+    --query "Stacks[0].Outputs[?OutputKey=='$1'].OutputValue" --output text
+}
+DISTRIBUTION=$(saida DistributionId)
+NOTIFIER_ARN=$(saida NotifierFunctionArn)
+[ "$NOTIFIER_ARN" = "None" ] && NOTIFIER_ARN=""
+ALERT_EMAIL=$(aws cloudformation describe-stacks --region "$REGION" --stack-name "$STACK" \
+  --query "Stacks[0].Parameters[?ParameterKey=='AlertEmail'].ParameterValue" --output text)
+[ "$ALERT_EMAIL" = "None" ] && ALERT_EMAIL=""
+aws cloudformation deploy \
+  --region us-east-1 \
+  --stack-name "$STACK-borda" \
+  --template-file "$DIR/template-borda.yaml" \
+  --no-fail-on-empty-changeset \
+  --parameter-overrides "DistributionId=$DISTRIBUTION" "NotifierFunctionArn=$NOTIFIER_ARN" "AlertEmail=$ALERT_EMAIL"
+
 aws cloudformation describe-stacks --region "$REGION" --stack-name "$STACK" \
   --query 'Stacks[0].Outputs' --output table

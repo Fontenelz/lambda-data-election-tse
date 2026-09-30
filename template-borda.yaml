@@ -1,0 +1,149 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Alarmes do CloudFront do coletor TSE. Fica em us-east-1 porque as métricas
+  do CloudFront só existem lá; publica num tópico próprio que aciona o mesmo
+  notificador do Telegram (sa-east-1) e/ou e-mail. Publicado pelo deploy.sh
+  com os valores tirados do stack principal.
+
+Parameters:
+  DistributionId:
+    Type: String
+    Description: ID da distribuição do stack principal (output DistributionId).
+  NotifierFunctionArn:
+    Type: String
+    Default: ""
+    Description: ARN do notificador do Telegram (vazio = sem Telegram).
+  AlertEmail:
+    Type: String
+    Default: ""
+    Description: E-mail para os alertas (vazio = sem e-mail).
+  Limite4xxPercent:
+    Type: Number
+    Default: 5
+    Description: Porcentagem de respostas 4xx (403 da CloudFront Function, 404...) que dispara o alarme.
+  Limite5xxPercent:
+    Type: Number
+    Default: 1
+    Description: Porcentagem de respostas 5xx que dispara o alarme.
+  MinimoRequisicoes:
+    Type: Number
+    Default: 100
+    Description: >-
+      Abaixo disso (em 5 min) a taxa de erro é ignorada — com pouco tráfego,
+      meia dúzia de acessos sem Origin já passaria do limite.
+
+Conditions:
+  HasTelegram: !Not [!Equals [!Ref NotifierFunctionArn, ""]]
+  HasAlertEmail: !Not [!Equals [!Ref AlertEmail, ""]]
+
+Resources:
+  # nome fixo: o stack principal libera o notificador para este ARN
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: coletor-tse-alertas-cloudfront
+
+  NotifierSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasTelegram
+    Properties:
+      TopicArn: !Ref AlertTopic
+      Protocol: lambda
+      Endpoint: !Ref NotifierFunctionArn
+
+  AlertEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasAlertEmail
+    Properties:
+      TopicArn: !Ref AlertTopic
+      Protocol: email
+      Endpoint: !Ref AlertEmail
+
+  # site recebendo 403/404: origem fora de AllowedOrigins (ex.: www.),
+  # preflight bloqueado ou arquivo que não existe
+  Errors4xxAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: coletor-tse-cloudfront-4xx
+      AlarmDescription: >-
+        Muitas requisições aos dados recusadas pelo CloudFront (4xx) — o site
+        pode não estar conseguindo ler os resultados.
+      EvaluationPeriods: 2
+      DatapointsToAlarm: 2
+      Threshold: !Ref Limite4xxPercent
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
+      OKActions: [!Ref AlertTopic]
+      Metrics:
+        - Id: requisicoes
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: AWS/CloudFront
+              MetricName: Requests
+              Dimensions:
+                - { Name: DistributionId, Value: !Ref DistributionId }
+                - { Name: Region, Value: Global }
+            Period: 300
+            Stat: Sum
+        - Id: taxa4xx
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: AWS/CloudFront
+              MetricName: 4xxErrorRate
+              Dimensions:
+                - { Name: DistributionId, Value: !Ref DistributionId }
+                - { Name: Region, Value: Global }
+            Period: 300
+            Stat: Average
+        - Id: alarme
+          Label: 4xx (%) com tráfego relevante
+          ReturnData: true
+          Expression: !Sub "IF(requisicoes >= ${MinimoRequisicoes}, taxa4xx, 0)"
+
+  # CloudFront sem conseguir entregar: S3 fora, erro na CloudFront Function
+  Errors5xxAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: coletor-tse-cloudfront-5xx
+      AlarmDescription: >-
+        CloudFront devolvendo erros 5xx — os dados não estão chegando ao site.
+      EvaluationPeriods: 1
+      Threshold: !Ref Limite5xxPercent
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
+      OKActions: [!Ref AlertTopic]
+      Metrics:
+        - Id: requisicoes
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: AWS/CloudFront
+              MetricName: Requests
+              Dimensions:
+                - { Name: DistributionId, Value: !Ref DistributionId }
+                - { Name: Region, Value: Global }
+            Period: 300
+            Stat: Sum
+        - Id: taxa5xx
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: AWS/CloudFront
+              MetricName: 5xxErrorRate
+              Dimensions:
+                - { Name: DistributionId, Value: !Ref DistributionId }
+                - { Name: Region, Value: Global }
+            Period: 300
+            Stat: Average
+        - Id: alarme
+          Label: 5xx (%) com tráfego relevante
+          ReturnData: true
+          Expression: !Sub "IF(requisicoes >= ${MinimoRequisicoes}, taxa5xx, 0)"
+
+Outputs:
+  AlertTopicArn:
+    Value: !Ref AlertTopic

@@ -13,7 +13,8 @@ from datetime import datetime, timedelta, timezone
 import boto3
 
 # Repassa para um grupo do Telegram os alarmes do CloudWatch publicados no
-# tópico SNS coletor-tse-alertas. O token do bot fica no SSM (SecureString).
+# tópico SNS coletor-tse-alertas (e coletor-tse-alertas-cloudfront, em
+# us-east-1, com os alarmes do CloudFront). O token do bot fica no SSM (SecureString).
 # Ao disparar, consulta os logs do coletor (campos erro_* gravados por ele) e a
 # métrica de coletas completas para explicar o que aconteceu e o que fazer. Se
 # essa consulta falhar, a mensagem básica é enviada mesmo assim.
@@ -34,6 +35,7 @@ MAX_LINHAS_ERRO = 8
 ssm = boto3.client("ssm")
 logs = boto3.client("logs")
 cloudwatch = boto3.client("cloudwatch")
+_cloudwatch_por_regiao = {REGION: cloudwatch}
 _token = None
 
 ALARMES = {
@@ -48,6 +50,28 @@ ALARMES = {
                   "Nenhuma coleta completa em {janela}. O site pode estar mostrando resultados atrasados."),
         "OK": ("✅", "Dados do site voltaram a atualizar", "As coletas completas voltaram."),
     },
+    "coletor-tse-cloudfront-4xx": {
+        "ALARM": ("🟠", "CloudFront recusando requisições (4xx)",
+                  "Parte relevante dos acessos aos dados está recebendo 403/404. Leitores podem estar "
+                  "sem resultados, mesmo com o coletor funcionando."),
+        "OK": ("✅", "CloudFront voltou a responder normalmente", "A taxa de 4xx voltou ao normal."),
+    },
+    "coletor-tse-cloudfront-5xx": {
+        "ALARM": ("🔴", "CloudFront com erros 5xx",
+                  "O CloudFront não está conseguindo entregar os dados ao site."),
+        "OK": ("✅", "CloudFront voltou a entregar os dados", "A taxa de 5xx voltou ao normal."),
+    },
+}
+
+# alarmes do CloudFront: não dependem do coletor, então a mensagem traz a
+# dica direto em vez do resumo dos logs dele
+DICAS_CLOUDFRONT = {
+    "coletor-tse-cloudfront-4xx": "Quase sempre é 403 da CloudFront Function: o site está numa origem fora de "
+                                  "AllowedOrigins (ex.: www.imirante.com) ou mudou de domínio. Confira o Origin "
+                                  "das requisições no navegador e rode deploy.sh AllowedOrigins=... com a lista "
+                                  "completa. 404 indica o site pedindo um arquivo que não existe.",
+    "coletor-tse-cloudfront-5xx": "Veja no console do CloudFront (Monitoramento) se o erro é de origem (S3) ou da "
+                                  "CloudFront Function; confira também a política do bucket.",
 }
 
 DICAS = {
@@ -96,8 +120,24 @@ def duracao(segundos):
     return f"{minutos // 60}h{minutos % 60:02d}"
 
 
-def link_console(fragmento):
-    return f"https://{REGION}.console.aws.amazon.com/cloudwatch/home?region={REGION}#{fragmento}"
+def link_console(fragmento, regiao=REGION):
+    return f"https://{regiao}.console.aws.amazon.com/cloudwatch/home?region={regiao}#{fragmento}"
+
+
+def link_cloudfront():
+    return "https://us-east-1.console.aws.amazon.com/cloudfront/v4/home#/monitoring"
+
+
+def regiao_do_alarme(alarme):
+    # AlarmArn: arn:aws:cloudwatch:<região>:<conta>:alarm:<nome>
+    partes = str(alarme.get("AlarmArn", "")).split(":")
+    return partes[3] if len(partes) > 3 and partes[3] else REGION
+
+
+def cloudwatch_em(regiao):
+    if regiao not in _cloudwatch_por_regiao:
+        _cloudwatch_por_regiao[regiao] = boto3.client("cloudwatch", region_name=regiao)
+    return _cloudwatch_por_regiao[regiao]
 
 
 def link_logs():
@@ -176,9 +216,9 @@ def ultima_coleta_completa(ate):
     return None
 
 
-def inicio_do_problema(nome_alarme, ate):
+def inicio_do_problema(nome_alarme, ate, regiao=REGION):
     # quando o alarme entrou em ALARM pela última vez antes de normalizar
-    historico = cloudwatch.describe_alarm_history(
+    historico = cloudwatch_em(regiao).describe_alarm_history(
         AlarmName=nome_alarme,
         HistoryItemType="StateUpdate",
         StartDate=ate - timedelta(days=2),
@@ -249,6 +289,7 @@ def formatar(mensagem_sns):
 
     nome = alarme.get("AlarmName", "?")
     estado = alarme.get("NewStateValue", "?")
+    regiao = regiao_do_alarme(alarme)
     try:
         momento = parse_data(alarme["StateChangeTime"])
     except (KeyError, ValueError):
@@ -263,10 +304,12 @@ def formatar(mensagem_sns):
               html.escape(impacto.format(janela=duracao(janela.total_seconds())))]
 
     try:
-        if estado == "ALARM":
+        if estado == "ALARM" and nome in DICAS_CLOUDFRONT:
+            linhas += ["", f"🔎 <b>O que fazer:</b> {html.escape(DICAS_CLOUDFRONT[nome])}"]
+        elif estado == "ALARM":
             linhas += [""] + linhas_de_contexto(momento, janela)
         elif estado == "OK" and alarme.get("OldStateValue") == "ALARM":
-            inicio = inicio_do_problema(nome, momento)
+            inicio = inicio_do_problema(nome, momento, regiao)
             if inicio:
                 linhas += ["", f"Problema durou <b>{duracao((momento - inicio).total_seconds())}</b> "
                               f"({hora(inicio)} → {hora(momento)})."]
@@ -274,10 +317,14 @@ def formatar(mensagem_sns):
         logger.exception("Não foi possível montar o contexto do alarme")
         linhas += ["", f"<i>(detalhes indisponíveis: {html.escape(type(error).__name__)} — veja os logs)</i>"]
 
+    if nome in DICAS_CLOUDFRONT:
+        detalhes = f'<a href="{link_cloudfront()}">Monitoramento do CloudFront</a>'
+    else:
+        detalhes = f'<a href="{link_logs()}">Logs do coletor</a>'
     linhas += [
         "",
-        f'<a href="{link_console("alarmsV2:alarm/" + urllib.parse.quote(nome))}">Alarme</a> · '
-        f'<a href="{link_logs()}">Logs do coletor</a> · {hora(momento)} (Brasília)',
+        f'<a href="{link_console("alarmsV2:alarm/" + urllib.parse.quote(nome), regiao)}">Alarme</a> · '
+        f'{detalhes} · {hora(momento)} (Brasília)',
     ]
     return "\n".join(linhas)
 
