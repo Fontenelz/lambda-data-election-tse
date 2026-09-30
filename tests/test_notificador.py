@@ -101,6 +101,24 @@ class AlarmesCloudFront(unittest.TestCase):
         self.assertEqual(notificador.regiao_do_alarme({}), "sa-east-1")
 
 
+class Handler(unittest.TestCase):
+    def evento(self, mensagem):
+        return {"Records": [{"Sns": {"Message": mensagem, "Subject": "teste"}}]}
+
+    def test_ok_sem_alarm_antes_nao_envia(self):
+        with mock.patch.object(notificador, "enviar") as enviar:
+            notificador.lambda_handler(self.evento(alarme("coletor-tse-erros", "OK", "INSUFFICIENT_DATA")), None)
+        enviar.assert_not_called()
+
+    def test_alarm_e_recuperacao_enviam(self):
+        with mock.patch.object(notificador, "enviar") as enviar, \
+                mock.patch.object(notificador, "formatar", return_value="x"):
+            notificador.lambda_handler(self.evento(alarme("coletor-tse-erros", "ALARM")), None)
+            notificador.lambda_handler(self.evento(alarme("coletor-tse-erros", "OK", "ALARM")), None)
+            notificador.lambda_handler(self.evento("teste manual"), None)
+        self.assertEqual(enviar.call_count, 3)
+
+
 class Enviar(unittest.TestCase):
     def setUp(self):
         self.chamar = mock.patch.object(notificador, "chamar_telegram").start()

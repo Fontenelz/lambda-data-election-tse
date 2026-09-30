@@ -367,8 +367,21 @@ def enviar(texto):
             raise
 
 
+def e_ruido(mensagem_sns):
+    # OK vindo de INSUFFICIENT_DATA (alarme recém-criado, ou sem tráfego no
+    # CloudFront) não é recuperação de nada: só avisa OK depois de um ALARM
+    try:
+        alarme = json.loads(mensagem_sns)
+    except ValueError:
+        return False
+    return alarme.get("NewStateValue") == "OK" and alarme.get("OldStateValue") != "ALARM"
+
+
 def lambda_handler(event, context):
     # erro aqui faz a Lambda retentar (invocação assíncrona do SNS)
     for record in event.get("Records", []):
+        if e_ruido(record["Sns"]["Message"]):
+            logger.info("Ignorado (OK sem ALARM antes): %s", record["Sns"].get("Subject"))
+            continue
         enviar(formatar(record["Sns"]["Message"]))
         logger.info("Alerta enviado ao Telegram: %s", record["Sns"].get("Subject"))
