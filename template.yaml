@@ -1,0 +1,483 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Coletor TSE (porte AWS do coletor_tse do GCP): Lambda agendada pelo
+  EventBridge Scheduler grava no S3 privado; CloudFront com OAC entrega ao site.
+
+Parameters:
+  BucketName:
+    Type: String
+    Default: raw-tse-data-2026
+    Description: Bucket existente (privado) onde o coletor grava. Não é gerenciado por este stack.
+  TseBaseUrl:
+    Type: String
+    Default: https://resultados-sim.tse.jus.br/simulado
+  TseAmbiente:
+    Type: String
+    Default: simulado2026
+  TseTurno:
+    Type: String
+    Default: "1"
+    AllowedValues: ["1", "2"]
+  TseUf:
+    Type: String
+    Default: ma
+  ScheduleExpression:
+    Type: String
+    Default: rate(5 minutes)
+    Description: rate(5 minutes) na janela de testes; rate(1 minute) na apuração.
+  ScheduleState:
+    Type: String
+    Default: ENABLED
+    AllowedValues: [ENABLED, DISABLED]
+  PythonRuntime:
+    Type: String
+    Default: python3.14
+  AllowedOrigins:
+    Type: CommaDelimitedList
+    Default: https://imirante.com
+    Description: >-
+      Únicas origens (esquema + host, sem barra final) que podem ler os dados.
+      Usado no CORS e no bloqueio da CloudFront Function; separe várias por vírgula.
+  AlertEmail:
+    Type: String
+    Default: ""
+    Description: E-mail para alertas de falha do coletor (vazio = sem e-mail).
+  TelegramChatId:
+    Type: String
+    Default: ""
+    Description: >-
+      ID do grupo/conversa do Telegram que recebe os alertas (vazio = sem Telegram).
+      O token do bot fica no SSM, no parâmetro TelegramTokenParam.
+  TelegramTokenParam:
+    Type: String
+    Default: /coletor-tse/telegram-token
+    Description: Parâmetro SecureString do SSM com o token do bot (criado fora do stack).
+  DadosParadosSegundos:
+    Type: Number
+    Default: 600
+    AllowedValues: [300, 600, 900, 1800, 3600]
+    Description: >-
+      Janela sem nenhuma coleta completa que dispara o alarme de dados parados.
+      Precisa ser maior que o intervalo do agendamento.
+
+Conditions:
+  HasAlertEmail: !Not [!Equals [!Ref AlertEmail, ""]]
+  HasTelegram: !Not [!Equals [!Ref TelegramChatId, ""]]
+  # com o agendamento pausado de propósito, "dados parados" seria alarme falso
+  ScheduleEnabled: !Equals [!Ref ScheduleState, ENABLED]
+
+Resources:
+  # --- Coletor ---------------------------------------------------------------
+
+  CollectorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/lambda/coletor-tse
+      RetentionInDays: 30
+
+  CollectorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: coletor-tse
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub "${CollectorLogGroup.Arn}"
+              - Effect: Allow
+                Action: [s3:GetObject, s3:PutObject]
+                Resource: !Sub "arn:${AWS::Partition}:s3:::${BucketName}/*"
+              - Effect: Allow
+                Action: s3:DeleteObject
+                Resource: !Sub "arn:${AWS::Partition}:s3:::${BucketName}/_controle/*"
+              # sem ListBucket, objeto inexistente volta como AccessDenied em vez de NoSuchKey
+              - Effect: Allow
+                Action: s3:ListBucket
+                Resource: !Sub "arn:${AWS::Partition}:s3:::${BucketName}"
+
+  CollectorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: coletor-tse
+      Description: Coleta resultados do TSE e publica no S3 (porte do coletor_tse GCP)
+      Runtime: !Ref PythonRuntime
+      Architectures: [arm64]
+      Handler: index.lambda_handler
+      Role: !GetAtt CollectorRole.Arn
+      Timeout: 120
+      MemorySize: 256
+      # código real é publicado pelo deploy.sh (update-function-code)
+      Code:
+        ZipFile: |
+          def lambda_handler(event, context):
+              print("codigo ainda nao publicado - rode aws/deploy.sh")
+      LoggingConfig:
+        LogFormat: JSON
+        ApplicationLogLevel: INFO
+        SystemLogLevel: WARN
+        LogGroup: !Ref CollectorLogGroup
+      Environment:
+        Variables:
+          BUCKET_NAME: !Ref BucketName
+          TSE_BASE_URL: !Ref TseBaseUrl
+          TSE_AMBIENTE: !Ref TseAmbiente
+          TSE_TURNO: !Ref TseTurno
+          TSE_UF: !Ref TseUf
+
+  # agendamento é assíncrono: sem retry e descartando evento velho, uma
+  # execução atrasada não se empilha com a próxima
+  CollectorInvokeConfig:
+    Type: AWS::Lambda::EventInvokeConfig
+    Properties:
+      FunctionName: !Ref CollectorFunction
+      Qualifier: $LATEST
+      MaximumRetryAttempts: 0
+      MaximumEventAgeInSeconds: 60
+
+  # --- Agendamento -----------------------------------------------------------
+
+  SchedulerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: scheduler.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals: { "aws:SourceAccount": !Ref AWS::AccountId }
+      Policies:
+        - PolicyName: invoke-coletor-tse
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt CollectorFunction.Arn
+
+  CollectorSchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: coletor-tse
+      Description: Dispara o coletor TSE
+      ScheduleExpression: !Ref ScheduleExpression
+      State: !Ref ScheduleState
+      FlexibleTimeWindow: { Mode: "OFF" }
+      Target:
+        Arn: !GetAtt CollectorFunction.Arn
+        RoleArn: !GetAtt SchedulerRole.Arn
+        RetryPolicy:
+          MaximumRetryAttempts: 0
+          MaximumEventAgeInSeconds: 60
+
+  # --- Alertas ---------------------------------------------------------------
+
+  # todos os alarmes publicam aqui; e-mail e Telegram são assinantes opcionais
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: coletor-tse-alertas
+
+  AlertEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasAlertEmail
+    Properties:
+      TopicArn: !Ref AlertTopic
+      Protocol: email
+      Endpoint: !Ref AlertEmail
+
+  NotifierLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: HasTelegram
+    Properties:
+      LogGroupName: /aws/lambda/coletor-tse-telegram
+      RetentionInDays: 30
+
+  NotifierRole:
+    Type: AWS::IAM::Role
+    Condition: HasTelegram
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: coletor-tse-telegram
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub "${NotifierLogGroup.Arn}"
+              # SecureString com a chave gerenciada aws/ssm: basta o GetParameter
+              - Effect: Allow
+                Action: ssm:GetParameter
+                Resource: !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${TelegramTokenParam}"
+              # contexto da mensagem: erros do coletor, última coleta completa e
+              # início do alarme (só leitura, restrito aos recursos do coletor)
+              - Effect: Allow
+                Action: logs:FilterLogEvents
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:${CollectorLogGroup}"
+                  - !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:${CollectorLogGroup}:*"
+              - Effect: Allow
+                Action: cloudwatch:DescribeAlarmHistory
+                Resource: !Sub "arn:${AWS::Partition}:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:coletor-tse-*"
+              # GetMetricData não aceita restrição por recurso
+              - Effect: Allow
+                Action: cloudwatch:GetMetricData
+                Resource: "*"
+
+  NotifierFunction:
+    Type: AWS::Lambda::Function
+    Condition: HasTelegram
+    Properties:
+      FunctionName: coletor-tse-telegram
+      Description: Repassa os alarmes do coletor TSE para o Telegram
+      Runtime: !Ref PythonRuntime
+      Architectures: [arm64]
+      Handler: index.lambda_handler
+      Role: !GetAtt NotifierRole.Arn
+      Timeout: 30
+      MemorySize: 128
+      # código real é publicado pelo deploy.sh (update-function-code)
+      Code:
+        ZipFile: |
+          def lambda_handler(event, context):
+              print("codigo ainda nao publicado - rode aws/deploy.sh")
+      LoggingConfig:
+        LogFormat: JSON
+        LogGroup: !Ref NotifierLogGroup
+      Environment:
+        Variables:
+          TELEGRAM_CHAT_ID: !Ref TelegramChatId
+          TELEGRAM_TOKEN_PARAM: !Ref TelegramTokenParam
+          COLETOR_LOG_GROUP: !Ref CollectorLogGroup
+
+  NotifierPermission:
+    Type: AWS::Lambda::Permission
+    Condition: HasTelegram
+    Properties:
+      FunctionName: !Ref NotifierFunction
+      Action: lambda:InvokeFunction
+      Principal: sns.amazonaws.com
+      SourceArn: !Ref AlertTopic
+
+  NotifierSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasTelegram
+    Properties:
+      TopicArn: !Ref AlertTopic
+      Protocol: lambda
+      Endpoint: !GetAtt NotifierFunction.Arn
+
+  CollectorErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: coletor-tse-erros
+      AlarmDescription: Coletor TSE falhou (config do TSE indisponível, coleta vazia ou exceção).
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref CollectorFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
+      OKActions: [!Ref AlertTopic]
+
+  # 1 por coleta completa (todos os cargos baixados); parcial, pulada por lock,
+  # erro ou coletor parado não contam
+  CompleteCollectionsMetric:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref CollectorLogGroup
+      FilterName: coletas-completas
+      FilterPattern: '{ $.coleta_status = "success" }'
+      MetricTransformations:
+        - MetricNamespace: ColetorTSE
+          MetricName: ColetasCompletas
+          MetricValue: "1"
+          DefaultValue: 0
+
+  StaleDataAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: ScheduleEnabled
+    Properties:
+      AlarmName: coletor-tse-dados-parados
+      AlarmDescription: >-
+        Nenhuma coleta completa na janela configurada — o site pode estar com
+        dados desatualizados (coletor parado, falhando, lock preso ou cargo
+        falhando sempre). Veja os logs do coletor-tse.
+      Namespace: ColetorTSE
+      MetricName: ColetasCompletas
+      Statistic: Sum
+      Period: !Ref DadosParadosSegundos
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: LessThanThreshold
+      # sem log nenhum = coletor nem rodou -> conta como parado
+      TreatMissingData: breaching
+      AlarmActions: [!Ref AlertTopic]
+      OKActions: [!Ref AlertTopic]
+
+  # --- Entrega (substitui o Worker Cloudflare + HMAC) ------------------------
+
+  OriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub "${BucketName}-oac"
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  # respeita o s-maxage=30 que o coletor grava; 30s é o padrão se faltar
+  CachePolicy:
+    Type: AWS::CloudFront::CachePolicy
+    Properties:
+      CachePolicyConfig:
+        Name: coletor-tse-30s
+        MinTTL: 0
+        DefaultTTL: 30
+        MaxTTL: 60
+        ParametersInCacheKeyAndForwardedToOrigin:
+          EnableAcceptEncodingGzip: true
+          EnableAcceptEncodingBrotli: true
+          CookiesConfig: { CookieBehavior: none }
+          HeadersConfig: { HeaderBehavior: none }
+          QueryStringsConfig: { QueryStringBehavior: none }
+
+  CorsPolicy:
+    Type: AWS::CloudFront::ResponseHeadersPolicy
+    Properties:
+      ResponseHeadersPolicyConfig:
+        Name: coletor-tse-cors
+        CorsConfig:
+          AccessControlAllowCredentials: false
+          AccessControlAllowHeaders: { Items: ["*"] }
+          AccessControlAllowMethods: { Items: [GET, HEAD, OPTIONS] }
+          AccessControlAllowOrigins: { Items: !Ref AllowedOrigins }
+          AccessControlMaxAgeSec: 600
+          OriginOverride: true
+
+  # CORS só vale dentro do navegador; esta função barra na borda (403) quem
+  # não vem do site. fetch() de outro domínio sempre manda Origin; o Referer
+  # cobre navegadores que omitem Origin em GET. Cabeçalhos são falsificáveis
+  # por scripts — impede uso por outros sites, não é autenticação.
+  OriginGuardFunction:
+    Type: AWS::CloudFront::Function
+    Properties:
+      Name: coletor-tse-somente-imirante
+      AutoPublish: true
+      FunctionConfig:
+        Comment: Libera só requisições vindas das origens permitidas
+        Runtime: cloudfront-js-2.0
+      FunctionCode: !Sub
+        - |
+          var PERMITIDAS = ['${Lista}'];
+
+          function handler(event) {
+              var headers = event.request.headers;
+              var origem = headers.origin && headers.origin.value;
+
+              if (!origem && headers.referer) {
+                  var m = headers.referer.value.match(/^https?:\/\/[^\/]+/);
+                  origem = m && m[0];
+              }
+
+              if (origem && PERMITIDAS.indexOf(origem) !== -1) {
+                  return event.request;
+              }
+              return { statusCode: 403, statusDescription: 'Forbidden' };
+          }
+        - Lista: !Join ["', '", !Ref AllowedOrigins]
+
+  Distribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Comment: Resultados TSE (coletor-tse)
+        Enabled: true
+        HttpVersion: http2and3
+        IPV6Enabled: true
+        # PriceClass_All é a única que inclui os pontos de presença da América do Sul
+        PriceClass: PriceClass_All
+        Origins:
+          - Id: s3-resultados
+            DomainName: !Sub "${BucketName}.s3.${AWS::Region}.amazonaws.com"
+            OriginAccessControlId: !GetAtt OriginAccessControl.Id
+            S3OriginConfig:
+              OriginAccessIdentity: ""
+        DefaultCacheBehavior:
+          TargetOriginId: s3-resultados
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD, OPTIONS]
+          CachedMethods: [GET, HEAD]
+          Compress: true
+          CachePolicyId: !Ref CachePolicy
+          ResponseHeadersPolicyId: !Ref CorsPolicy
+          FunctionAssociations:
+            - EventType: viewer-request
+              FunctionARN: !GetAtt OriginGuardFunction.FunctionMetadata.FunctionARN
+
+  # único dono da política do bucket existente (não havia política antes)
+  BucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref BucketName
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          # CloudFront só lê o índice e os arquivos espelhados do TSE — o lock
+          # em _controle/ e qualquer outra coisa no bucket ficam de fora
+          - Sid: CloudFrontLeResultados
+            Effect: Allow
+            Principal: { Service: cloudfront.amazonaws.com }
+            Action: s3:GetObject
+            Resource:
+              - !Sub "arn:${AWS::Partition}:s3:::${BucketName}/dados_eleicao.json"
+              - !Sub "arn:${AWS::Partition}:s3:::${BucketName}/*/dados/*"
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub "arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${Distribution}"
+          - Sid: SomenteTLS
+            Effect: Deny
+            Principal: "*"
+            Action: s3:*
+            Resource:
+              - !Sub "arn:${AWS::Partition}:s3:::${BucketName}"
+              - !Sub "arn:${AWS::Partition}:s3:::${BucketName}/*"
+            Condition:
+              Bool: { "aws:SecureTransport": "false" }
+
+Outputs:
+  FunctionName:
+    Value: !Ref CollectorFunction
+  NotifierFunctionName:
+    Condition: HasTelegram
+    Value: !Ref NotifierFunction
+  AlertTopicArn:
+    Value: !Ref AlertTopic
+  DistributionDomain:
+    Description: Base pública dos dados (substitui https://eleicoes.imirante.com.br no fetch do site)
+    Value: !Sub "https://${Distribution.DomainName}"
+  DistributionId:
+    Value: !Ref Distribution
+  IndexUrl:
+    Value: !Sub "https://${Distribution.DomainName}/dados_eleicao.json"
