@@ -93,9 +93,16 @@ class SegundoTurno(unittest.TestCase):
     # parâmetros do dia: TsePleito=3221 TseTurno=2 TseEleicoes=6258,6260
     AMBIENTE = {"PLEITOS": {"3221"}, "TURNO": "2", "ELEICOES": {"6258", "6260"}}
 
-    def test_so_presidente_para_o_ma(self):
-        # 6260 (governador) não tem MA; suplementares/consultas do 3221 ficam de fora
+    def test_presidente_e_governador_das_ufs_com_2o_turno(self):
+        # 6260 (governador) não tem MA: listada em TseEleicoes, entra cada UF do
+        # ele-c.json na sua pasta; suplementares/consultas do 3221 ficam de fora
         _, puts = gravacoes(novo, CONFIG_OFICIAL, ambiente=self.AMBIENTE)
+        self.assertEqual(sorted(p["Key"] for p in puts), sorted(
+            ["oficial/ele2026/6258/dados/br/br-c0001-e006258-u.json", "dados_eleicao.json"]
+            + [f"oficial/ele2026/6260/dados/{uf}/{uf}-c0003-e006260-u.json" for uf in ("am", "rn", "df", "es", "ac")]))
+
+    def test_so_presidente_sem_6260_na_lista(self):
+        _, puts = gravacoes(novo, CONFIG_OFICIAL, ambiente={**self.AMBIENTE, "ELEICOES": {"6258"}})
         self.assertEqual([p["Key"] for p in puts],
                          ["oficial/ele2026/6258/dados/br/br-c0001-e006258-u.json", "dados_eleicao.json"])
 

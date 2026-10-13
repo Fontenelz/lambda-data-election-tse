@@ -113,6 +113,11 @@ class ListarAlvos(unittest.TestCase):
         ]}]}
         with mock.patch.object(coletor, "TURNO", "2"):
             self.assertEqual(self.cargos(config), [("1", "br")])
+        # listada em TSE_ELEICOES: cada UF na sua pasta, com abrangência própria
+        with mock.patch.object(coletor, "TURNO", "2"), mock.patch.object(coletor, "ELEICOES", {"6258", "6260"}):
+            self.assertEqual(self.cargos(config), [("3", uf) for uf in ("am", "rn", "df", "es", "ac")] + [("1", "br")])
+            abrangencias = {alvo[4] for alvo in coletor.listar_alvos(config)}
+            self.assertEqual(abrangencias, {"federal"} | {f"estadual-{uf}" for uf in ("am", "rn", "df", "es", "ac")})
 
     def test_ciclo_vem_do_pleito_de_cada_eleicao(self):
         # ele-c.json oficial lista pleitos de ele2024 antes dos de ele2026

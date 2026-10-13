@@ -335,15 +335,22 @@ def listar_alvos(config):
 
             # nas eleições gerais o índice traz abr.cd = "br" e a pasta/UF é
             # decidida pelo código do cargo; abrangência de outra UF (eleição
-            # suplementar, consulta popular) não é nossa
+            # suplementar, consulta popular) não é nossa — a não ser que a
+            # eleição esteja em TSE_ELEICOES (ex.: governador do 2º turno, 6260)
+            explicita = str(eleicao["cd"]) in ELEICOES
             for abrangencia in eleicao.get("abr", []):
-                if str(abrangencia.get("cd", "br")).lower() not in ("br", UF):
+                cod_uf = str(abrangencia.get("cd", "br")).lower()
+                if cod_uf in ("br", UF):
+                    uf_pasta, rotulo_estadual = UF, "estadual"
+                elif explicita:
+                    uf_pasta, rotulo_estadual = cod_uf, f"estadual-{cod_uf}"
+                else:
                     continue
                 for cargo in abrangencia.get("cp", []):
                     if str(cargo["cd"]) in CARGOS_FEDERAIS:
                         yield pleito, eleicao, cargo, "br", "federal"
                     elif str(cargo["cd"]) in CARGOS_ESTADUAIS:
-                        yield pleito, eleicao, cargo, UF, "estadual"
+                        yield pleito, eleicao, cargo, uf_pasta, rotulo_estadual
                     # demais: cargo municipal ou exclusivo do DF - ainda não coberto
 
 
