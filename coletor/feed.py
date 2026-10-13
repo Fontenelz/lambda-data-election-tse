@@ -619,7 +619,7 @@ class FeedRapido:
         self._garantir_fotos(candidatos, base)
 
         # agora.json por último: seq novo nele => os outros dois já existem
-        for nome, doc, cache in ((ARQ_MUN_UF, municipios_uf, CACHE_RAPIDO),
+        for nome, doc, cache in ((ARQ_MUN_UF, municipios_uf, CACHE_MUNICIPIOS),
                                  (ARQ_HISTORICO, historico, CACHE_RAPIDO),
                                  (ARQ_AGORA, agora, CACHE_RAPIDO)):
             try:

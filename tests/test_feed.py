@@ -361,10 +361,14 @@ class Handlers(Base):
         puts = {c.kwargs["Key"]: c.kwargs for c in self.s3.put_object.call_args_list}
         self.assertEqual(list(puts), ["aovivo/teste/municipios-ma.json", "aovivo/teste/historico.json",
                                       "aovivo/teste/agora.json"])
-        for put in puts.values():
+        # contrato: agora/historico max-age=5; municípios max-age=10
+        cache = {"aovivo/teste/agora.json": "public, max-age=5, s-maxage=5, stale-while-revalidate=30, stale-if-error=600",
+                 "aovivo/teste/historico.json": "public, max-age=5, s-maxage=5, stale-while-revalidate=30, stale-if-error=600",
+                 "aovivo/teste/municipios-ma.json":
+                     "public, max-age=10, s-maxage=5, stale-while-revalidate=30, stale-if-error=600"}
+        for chave, put in puts.items():
             self.assertEqual(put["ContentType"], "application/json; charset=utf-8")
-            self.assertEqual(put["CacheControl"],
-                             "public, max-age=5, s-maxage=5, stale-while-revalidate=30, stale-if-error=600")
+            self.assertEqual(put["CacheControl"], cache[chave], chave)
             json.loads(put["Body"])
 
         self.tse.editar(f"{ELE}/config/mun-e006257-cm.json",
