@@ -60,6 +60,13 @@ O `~/.aws/config` tem `region = us-east-1` como padrão — sempre passar a regi
 
 Mais recente primeiro. Cada entrada: data, o quê, por quê, como foi verificado.
 
+- **2026-10-13** — Espelho coleta o governador do 2º turno (6260) em AM/RN/DF/ES/AC (commit `675b61a`):
+  eleição listada em `TseEleicoes` aceita abrangência de outra UF (pasta da UF, abrangência
+  `estadual-<uf>` no índice para não colidir). Sem `TseEleicoes`, como antes. Verificado: 93 testes OK;
+  os 6 arquivos do 3221 respondem 200 no TSE. Antes disso, feed (`8aec46e`) já tinha sido implantado
+  às 15:03 UTC com parâmetros do 1º turno (código conferido byte a byte com o repo). Teste do 2º turno:
+  `deploy.sh TsePleito=3221 TseTurno=2 TseEleicoes=6258,6260 FeedPrefixo=aovivo/teste/t2/`.
+
 - **2026-10-13** — Feed `/eleicoes/ao-vivo` implementado (local, *não implantado, não commitado*):
   - `coletor/feed.py` (handlers `handler_rapido`/`handler_municipios`), `coletor/contrato.py` +
     `coletor/esquemas/` (JSON Schema), `coletor/fastjsonschema/` (vendorizado 2.21.1),

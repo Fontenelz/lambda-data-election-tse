@@ -143,6 +143,13 @@ class Leitura(unittest.TestCase):
     def test_iso_tse(self):
         self.assertEqual(self.feed.iso_tse("05/10/2026", "12:51:05"), "2026-10-05T12:51:05-03:00")
 
+    def test_hora_fonte_antes_da_totalizacao(self):
+        # 2º turno antes da eleição: TSE manda dt/ht vazios (visto em 13/10/2026, 6258)
+        dados = {"dg": "13/10/2026", "hg": "10:56:48", "dt": "", "ht": ""}
+        self.assertEqual(self.feed.hora_fonte(dados), "2026-10-13T10:56:48-03:00")
+        dados.update(dt="25/10/2026", ht="18:42:01")
+        self.assertEqual(self.feed.hora_fonte(dados), "2026-10-25T18:42:01-03:00")
+
 
 class Historico(unittest.TestCase):
     feed = carregar_feed({"BUCKET_NAME": "bucket-teste", "FEED_HISTORICO_MAX": "5"})

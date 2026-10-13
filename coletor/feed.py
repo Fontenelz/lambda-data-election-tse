@@ -331,6 +331,14 @@ def iso_tse(data, hora):
     return datetime.strptime(f"{data} {hora}", "%d/%m/%Y %H:%M:%S").replace(tzinfo=BRASILIA).isoformat()
 
 
+def hora_fonte(dados):
+    # dt/ht = última totalização; antes da 1ª (ex.: 2º turno antes da eleição)
+    # vêm vazios -> usa dg/hg, hora em que o TSE gerou o arquivo
+    if str(dados.get("dt") or "").strip() and str(dados.get("ht") or "").strip():
+        return iso_tse(dados["dt"], dados["ht"])
+    return iso_tse(dados["dg"], dados["hg"])
+
+
 def candidatos_tse(dados):
     for cargo in dados.get("carg", []):
         for agremiacao in cargo.get("agr", []):
@@ -630,7 +638,7 @@ class FeedRapido:
             "versao": 1,
             "seq": seq,
             "gerado": gerado,
-            "fonte_atualizado": iso_tse(dados_br["dt"], dados_br["ht"]),
+            "fonte_atualizado": hora_fonte(dados_br),
             "turno": int(coletor.TURNO),
             "ambiente": coletor.AMBIENTE,
             "recarregar": FEED_RECARREGAR,
