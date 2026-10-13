@@ -1,0 +1,92 @@
+{
+  "type": "object",
+  "required": [
+    "versao",
+    "seq",
+    "pontos"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "versao": {
+      "const": 1
+    },
+    "seq": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "pontos": {
+      "type": "array",
+      "maxItems": 600,
+      "items": {
+        "type": "object",
+        "required": [
+          "t",
+          "br",
+          "ma"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "t": {
+            "type": "string",
+            "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}-03:00$"
+          },
+          "br": {
+            "type": "object",
+            "required": [
+              "pst",
+              "votos"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "pst": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 1
+              },
+              "votos": {
+                "type": "object",
+                "minProperties": 1,
+                "propertyNames": {
+                  "pattern": "^\\d{2}$"
+                },
+                "additionalProperties": {
+                  "type": "integer",
+                  "minimum": 0
+                }
+              }
+            }
+          },
+          "ma": {
+            "type": "object",
+            "required": [
+              "pst",
+              "votos"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "pst": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 1
+              },
+              "votos": {
+                "type": "object",
+                "minProperties": 1,
+                "propertyNames": {
+                  "pattern": "^\\d{2}$"
+                },
+                "additionalProperties": {
+                  "type": "integer",
+                  "minimum": 0
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "historico.schema.json",
+  "title": "historico.json (feed v1)"
+}

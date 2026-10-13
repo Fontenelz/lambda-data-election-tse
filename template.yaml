@@ -2,6 +2,18 @@ AWSTemplateFormatVersion: "2010-09-09"
 Description: >-
   Coletor TSE (porte AWS do coletor_tse do GCP): Lambda agendada pelo
   EventBridge Scheduler grava no S3 privado; CloudFront com OAC entrega ao site.
+  Feed /eleicoes/ao-vivo em funções próprias, isoladas do espelho.
+
+Metadata:
+  AWSToolsMetrics:
+    AWSAgentToolkit: aws-cloudformation@2
+  com.aws.cloudformation.Context:
+    arch: TSE -> Lambdas (espelho | feed rápido | feed municípios) -> S3 privado -> CloudFront(OAC) -> imirante.com
+    must:
+      - tudo regional em sa-east-1 (projeto AWS); alarmes do CloudFront ficam em template-borda.yaml (us-east-1)
+      - conta com 10 execuções concorrentes de Lambda -> sem ReservedConcurrency; sobreposição evitada por lock no S3 (_controle/*.lock)
+      - espelho e feed não podem derrubar um ao outro -> funções, locks e log groups separados
+    ref: README.md, CLAUDE.md
 
 Parameters:
   BucketName:
@@ -67,12 +79,53 @@ Parameters:
     Description: >-
       Janela sem nenhuma coleta completa que dispara o alarme de dados parados.
       Precisa ser maior que o intervalo do agendamento.
+  TseEleicoes:
+    Type: String
+    Default: ""
+    AllowedPattern: "^[0-9, ]*$"
+    Description: >-
+      Códigos de eleição a coletar, separados por vírgula (vazio = todas do pleito/turno).
+      2º turno 2026: 6258,6260. Vale para o espelho e para o feed.
+  FeedPrefixo:
+    Type: String
+    Default: aovivo/2026/t2/
+    AllowedPattern: "^[a-z0-9][a-z0-9/_-]*/$"
+    Description: Pasta do feed /eleicoes/ao-vivo no bucket (com / no fim). O CloudFront só lê esta pasta.
+  FeedRecarregar:
+    Type: String
+    Default: ""
+    Description: Mudar o valor faz os leitores da página recarregarem (1x, espalhado em 1 min). Vazio = null.
+  FeedAviso:
+    Type: String
+    Default: ""
+    Description: Aviso exibido em destaque na página (vazio = null).
+  FeedCores:
+    Type: String
+    Default: ""
+    Description: 'Cor por candidato, JSON (ex.: {"13":"#C0392B","22":"#2543F4"}); vazio = página decide.'
+  FeedScheduleState:
+    Type: String
+    Default: DISABLED
+    AllowedValues: [ENABLED, DISABLED]
+    Description: Liga/desliga os dois agendamentos do feed (independente do espelho).
+  FeedAlarme:
+    Type: String
+    Default: DISABLED
+    AllowedValues: [ENABLED, DISABLED]
+    Description: Alarme de feed parado (ligar durante a apuração; exige FeedScheduleState=ENABLED).
+  FeedParadoSegundos:
+    Type: Number
+    Default: 180
+    AllowedValues: [120, 180, 300, 600]
+    Description: Janela sem nenhum agora.json gravado que dispara o alarme coletor-tse-feed-parado.
 
 Conditions:
   HasAlertEmail: !Not [!Equals [!Ref AlertEmail, ""]]
   HasTelegram: !Not [!Equals [!Ref TelegramChatId, ""]]
   # com o agendamento pausado de propósito, "dados parados" seria alarme falso
   ScheduleEnabled: !Equals [!Ref ScheduleState, ENABLED]
+  FeedEnabled: !Equals [!Ref FeedScheduleState, ENABLED]
+  FeedAlarmEnabled: !And [!Condition FeedEnabled, !Equals [!Ref FeedAlarme, ENABLED]]
 
 Resources:
   # --- Coletor ---------------------------------------------------------------
@@ -140,6 +193,7 @@ Resources:
           TSE_PLEITO: !Ref TsePleito
           TSE_TURNO: !Ref TseTurno
           TSE_UF: !Ref TseUf
+          TSE_ELEICOES: !Ref TseEleicoes
 
   # agendamento é assíncrono: sem retry e descartando evento velho, uma
   # execução atrasada não se empilha com a próxima
@@ -187,6 +241,240 @@ Resources:
         RetryPolicy:
           MaximumRetryAttempts: 0
           MaximumEventAgeInSeconds: 60
+
+  # --- Feed /eleicoes/ao-vivo (coletor/feed.py) -------------------------------
+  # Duas funções com o mesmo código do coletor (handlers diferentes) e locks
+  # próprios: o ciclo rápido (agora/municipios-<uf>/historico) nunca espera a
+  # varredura dos municípios do Brasil, e nenhuma delas trava o espelho.
+
+  FeedLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/lambda/coletor-tse-feed
+      RetentionInDays: 30
+
+  FeedMunicipiosLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/lambda/coletor-tse-feed-municipios
+      RetentionInDays: 30
+
+  FeedRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: role única das 2 fns do feed; S3 restrito a FeedPrefixo + _controle (locks, cache ele-c, estado)
+        must:
+          - sem PutObject fora de FeedPrefixo/_controle -> feed não sobrescreve o espelho nem o índice
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: coletor-tse-feed
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource:
+                  - !GetAtt FeedLogGroup.Arn
+                  - !GetAtt FeedMunicipiosLogGroup.Arn
+              - Effect: Allow
+                Action: [s3:GetObject, s3:PutObject]
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:s3:::${BucketName}/${FeedPrefixo}*"
+                  - !Sub "arn:${AWS::Partition}:s3:::${BucketName}/_controle/*"
+              - Effect: Allow
+                Action: s3:DeleteObject
+                Resource: !Sub "arn:${AWS::Partition}:s3:::${BucketName}/_controle/*"
+              # sem ListBucket, objeto inexistente volta como AccessDenied em vez de NoSuchKey
+              - Effect: Allow
+                Action: s3:ListBucket
+                Resource: !Sub "arn:${AWS::Partition}:s3:::${BucketName}"
+
+  FeedFunction:
+    Type: AWS::Lambda::Function
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: ciclo rápido; 1 invocação/min faz ciclos a cada 15s até 45s (~246 GETs condicionais/ciclo, 16 threads)
+        must:
+          - Timeout (60) < FEED_LOCK_TTL_SEGUNDOS (90) e > FEED_JANELA + 1 ciclo
+    Properties:
+      FunctionName: coletor-tse-feed
+      Description: Feed /eleicoes/ao-vivo - agora.json, municipios-<uf>.json, historico.json
+      Runtime: !Ref PythonRuntime
+      Architectures: [arm64]
+      Handler: feed.handler_rapido
+      Role: !GetAtt FeedRole.Arn
+      Timeout: 60
+      MemorySize: 512
+      # código real é publicado pelo deploy.sh (update-function-code)
+      Code:
+        ZipFile: |
+          def handler_rapido(event, context):
+              print("codigo ainda nao publicado - rode aws/deploy.sh")
+      LoggingConfig:
+        LogFormat: JSON
+        ApplicationLogLevel: INFO
+        SystemLogLevel: WARN
+        LogGroup: !Ref FeedLogGroup
+      Environment:
+        Variables:
+          BUCKET_NAME: !Ref BucketName
+          TSE_BASE_URL: !Ref TseBaseUrl
+          TSE_AMBIENTE: !Ref TseAmbiente
+          TSE_PLEITO: !Ref TsePleito
+          TSE_TURNO: !Ref TseTurno
+          TSE_UF: !Ref TseUf
+          TSE_ELEICOES: !Ref TseEleicoes
+          FEED_PREFIXO: !Ref FeedPrefixo
+          FEED_RECARREGAR: !Ref FeedRecarregar
+          FEED_AVISO: !Ref FeedAviso
+          FEED_CORES: !Ref FeedCores
+          FEED_BASE_URL: !Sub "https://${Distribution.DomainName}"
+          FEED_LOCK_TTL_SEGUNDOS: "90"
+          FEED_MUN_LOCK_TTL_SEGUNDOS: "180"
+
+  FeedMunicipiosFunction:
+    Type: AWS::Lambda::Function
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: ciclo lento; 27 {uf}-ab.json detectam o que mudou -> só baixa esses municípios (32 threads); estado em _controle/
+        must:
+          - Timeout (120) < FEED_MUN_LOCK_TTL_SEGUNDOS (180)
+    Properties:
+      FunctionName: coletor-tse-feed-municipios
+      Description: Feed /eleicoes/ao-vivo - municipios-br.json (5.571 municipios)
+      Runtime: !Ref PythonRuntime
+      Architectures: [arm64]
+      Handler: feed.handler_municipios
+      Role: !GetAtt FeedRole.Arn
+      Timeout: 120
+      MemorySize: 512
+      Code:
+        ZipFile: |
+          def handler_municipios(event, context):
+              print("codigo ainda nao publicado - rode aws/deploy.sh")
+      LoggingConfig:
+        LogFormat: JSON
+        ApplicationLogLevel: INFO
+        SystemLogLevel: WARN
+        LogGroup: !Ref FeedMunicipiosLogGroup
+      Environment:
+        # mesmas variáveis do FeedFunction (CloudFormation não aceita alias YAML)
+        Variables:
+          BUCKET_NAME: !Ref BucketName
+          TSE_BASE_URL: !Ref TseBaseUrl
+          TSE_AMBIENTE: !Ref TseAmbiente
+          TSE_PLEITO: !Ref TsePleito
+          TSE_TURNO: !Ref TseTurno
+          TSE_UF: !Ref TseUf
+          TSE_ELEICOES: !Ref TseEleicoes
+          FEED_PREFIXO: !Ref FeedPrefixo
+          FEED_RECARREGAR: !Ref FeedRecarregar
+          FEED_AVISO: !Ref FeedAviso
+          FEED_CORES: !Ref FeedCores
+          FEED_BASE_URL: !Sub "https://${Distribution.DomainName}"
+          FEED_LOCK_TTL_SEGUNDOS: "90"
+          FEED_MUN_LOCK_TTL_SEGUNDOS: "180"
+
+  FeedInvokeConfig:
+    Type: AWS::Lambda::EventInvokeConfig
+    Properties:
+      FunctionName: !Ref FeedFunction
+      Qualifier: $LATEST
+      MaximumRetryAttempts: 0
+      MaximumEventAgeInSeconds: 60
+
+  FeedMunicipiosInvokeConfig:
+    Type: AWS::Lambda::EventInvokeConfig
+    Properties:
+      FunctionName: !Ref FeedMunicipiosFunction
+      Qualifier: $LATEST
+      MaximumRetryAttempts: 0
+      MaximumEventAgeInSeconds: 60
+
+  FeedSchedulerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: scheduler.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals: { "aws:SourceAccount": !Ref AWS::AccountId }
+      Policies:
+        - PolicyName: invoke-coletor-tse-feed
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource:
+                  - !GetAtt FeedFunction.Arn
+                  - !GetAtt FeedMunicipiosFunction.Arn
+
+  FeedSchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: coletor-tse-feed
+      Description: Dispara o ciclo rápido do feed (ciclos internos a cada 15s)
+      ScheduleExpression: rate(1 minute)
+      State: !Ref FeedScheduleState
+      FlexibleTimeWindow: { Mode: "OFF" }
+      Target:
+        Arn: !GetAtt FeedFunction.Arn
+        RoleArn: !GetAtt FeedSchedulerRole.Arn
+        RetryPolicy:
+          MaximumRetryAttempts: 0
+          MaximumEventAgeInSeconds: 60
+
+  FeedMunicipiosSchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: coletor-tse-feed-municipios
+      Description: Dispara a varredura dos municípios do Brasil
+      ScheduleExpression: rate(1 minute)
+      State: !Ref FeedScheduleState
+      FlexibleTimeWindow: { Mode: "OFF" }
+      Target:
+        Arn: !GetAtt FeedMunicipiosFunction.Arn
+        RoleArn: !GetAtt FeedSchedulerRole.Arn
+        RetryPolicy:
+          MaximumRetryAttempts: 0
+          MaximumEventAgeInSeconds: 60
+
+  # 1 por agora.json gravado (feed_status = "gravado"); erro, pulada por lock
+  # ou função parada não contam
+  FeedWrittenMetric:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref FeedLogGroup
+      FilterName: feed-gravado
+      FilterPattern: '{ $.feed_status = "gravado" }'
+      MetricTransformations:
+        - MetricNamespace: ColetorTSE
+          MetricName: FeedGravado
+          MetricValue: "1"
+          DefaultValue: 0
+
+  FeedMunicipiosWrittenMetric:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref FeedMunicipiosLogGroup
+      FilterName: feed-municipios-gravado
+      FilterPattern: '{ $.feed_status = "municipios-gravado" }'
+      MetricTransformations:
+        - MetricNamespace: ColetorTSE
+          MetricName: FeedMunicipiosGravado
+          MetricValue: "1"
+          DefaultValue: 0
 
   # --- Alertas ---------------------------------------------------------------
 
@@ -240,6 +528,8 @@ Resources:
                 Resource:
                   - !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:${CollectorLogGroup}"
                   - !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:${CollectorLogGroup}:*"
+                  - !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:${FeedLogGroup}"
+                  - !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:${FeedLogGroup}:*"
               - Effect: Allow
                 Action: cloudwatch:DescribeAlarmHistory
                 Resource:
@@ -275,6 +565,7 @@ Resources:
           TELEGRAM_CHAT_ID: !Ref TelegramChatId
           TELEGRAM_TOKEN_PARAM: !Ref TelegramTokenParam
           COLETOR_LOG_GROUP: !Ref CollectorLogGroup
+          FEED_LOG_GROUP: !Ref FeedLogGroup
 
   NotifierPermission:
     Type: AWS::Lambda::Permission
@@ -354,6 +645,27 @@ Resources:
       Threshold: 1
       ComparisonOperator: LessThanThreshold
       # sem log nenhum = coletor nem rodou -> conta como parado
+      TreatMissingData: breaching
+      AlarmActions: [!Ref AlertTopic]
+      OKActions: [!Ref AlertTopic]
+
+  FeedStaleAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: FeedAlarmEnabled
+    Properties:
+      AlarmName: coletor-tse-feed-parado
+      AlarmDescription: >-
+        Nenhum agora.json gravado na janela configurada — a página
+        /eleicoes/ao-vivo está parada (feed desligado, TSE fora, contrato
+        inválido ou lock preso). Veja os logs do coletor-tse-feed.
+      Namespace: ColetorTSE
+      MetricName: FeedGravado
+      Statistic: Sum
+      Period: !Ref FeedParadoSegundos
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: LessThanThreshold
+      # sem log nenhum = feed nem rodou -> conta como parado
       TreatMissingData: breaching
       AlarmActions: [!Ref AlertTopic]
       OKActions: [!Ref AlertTopic]
@@ -495,8 +807,8 @@ Resources:
       PolicyDocument:
         Version: "2012-10-17"
         Statement:
-          # CloudFront só lê o índice e os arquivos espelhados do TSE — o lock
-          # em _controle/ e qualquer outra coisa no bucket ficam de fora
+          # CloudFront só lê o índice, os arquivos espelhados do TSE e o feed —
+          # locks/estado em _controle/ e qualquer outra coisa no bucket ficam de fora
           - Sid: CloudFrontLeResultados
             Effect: Allow
             Principal: { Service: cloudfront.amazonaws.com }
@@ -504,6 +816,8 @@ Resources:
             Resource:
               - !Sub "arn:${AWS::Partition}:s3:::${BucketName}/dados_eleicao.json"
               - !Sub "arn:${AWS::Partition}:s3:::${BucketName}/*/dados/*"
+              # feed /eleicoes/ao-vivo (agora.json, municipios-*.json, historico.json, fotos/)
+              - !Sub "arn:${AWS::Partition}:s3:::${BucketName}/${FeedPrefixo}*"
             Condition:
               StringEquals:
                 AWS:SourceArn: !Sub "arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${Distribution}"
@@ -535,3 +849,10 @@ Outputs:
     Value: !Ref Distribution
   IndexUrl:
     Value: !Sub "https://${Distribution.DomainName}/dados_eleicao.json"
+  FeedFunctionName:
+    Value: !Ref FeedFunction
+  FeedMunicipiosFunctionName:
+    Value: !Ref FeedMunicipiosFunction
+  FeedUrl:
+    Description: APURACAO_FEED_URL do site (/eleicoes/ao-vivo)
+    Value: !Sub "https://${Distribution.DomainName}/${FeedPrefixo}"

@@ -1,0 +1,2 @@
+fastjsonschema 2.21.1 (PyPI), sem alterações — vendorizado para o validador do contrato
+rodar na Lambda sem pip no deploy. Licença: LICENSE (BSD-3-Clause).

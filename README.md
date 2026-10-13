@@ -22,12 +22,17 @@ TSE ──GET──▶ Lambda coletor-tse ──PutObject──▶ S3 raw-tse-da
 
 ## Arquivos
 
-- `coletor/index.py` — o coletor (sem dependências externas; `boto3` já vem no runtime)
+- `coletor/index.py` — o coletor/espelho (sem dependências externas; `boto3` já vem no runtime)
+- `coletor/feed.py` — feed da página `/eleicoes/ao-vivo` (Lambdas `coletor-tse-feed` e `coletor-tse-feed-municipios`, mesmo zip); ver [Feed /eleicoes/ao-vivo](#feed-eleicoesao-vivo)
+- `coletor/contrato.py` + `coletor/esquemas/*.schema.json` — validação do contrato v1 do feed (JSON Schema + regras); `coletor/fastjsonschema/` é a biblioteca vendorizada (BSD, sem alterações)
+- `coletor/municipios_ibge.json` — nomes oficiais dos 5.571 municípios por código IBGE (gerado por `ferramentas/gerar_municipios.py`)
+- `coletor/local.py` — modo CLI: gera o feed numa pasta, sem AWS (não vai para o zip)
 - `template.yaml` — toda a infraestrutura (CloudFormation, `sa-east-1`)
 - `template-borda.yaml` — alarmes do CloudFront (stack `coletor-tse-borda` em `us-east-1`, onde ficam as métricas do CloudFront); publicado pelo `deploy.sh`
 - `notificador/index.py` — repassa os alarmes para o Telegram
 - `deploy.sh` — publica infraestrutura e código
-- `tests/` — testes unitários do coletor, do notificador e da CloudFront Function (esta roda no `node`, se instalado); não vão para o zip da Lambda
+- `tests/` — testes unitários do coletor, do feed, do contrato, do notificador e da CloudFront Function (esta roda no `node`, se instalado), não regressão do espelho contra a cópia de produção (`tests/legado/`) e fixtures reais do 1º turno (`tests/fixtures/tse`, baixadas por `ferramentas/baixar_fixtures.sh`); não vão para o zip da Lambda
+- `CLAUDE.md` — contexto do projeto e registro de mudanças
 
 ## Testes
 
@@ -35,7 +40,11 @@ Rodam com o Python puro, sem AWS nem `boto3` instalado (o boto3 é trocado por m
 
 ```bash
 python3 -m unittest discover -s tests -v
+# sem python3 no PATH (ex.: só uv instalado):
+uv run --no-project --python 3.14 python -m unittest discover -s tests -v
 ```
+
+O `deploy.sh` roda os testes antes de publicar e para se algum falhar (`SEM_TESTES=1 aws/deploy.sh ...` pula, só em emergência).
 
 ## Diferenças em relação à versão GCP
 
@@ -67,11 +76,112 @@ aws/deploy.sh AlertEmail=voce@exemplo.com            # notificação por e-mail 
 aws/deploy.sh TelegramChatId=-100123...              # notificação no Telegram (ver "Alertas no Telegram")
 aws/deploy.sh DadosParadosSegundos=900               # janela do alarme de dados parados
 aws/deploy.sh AllowedOrigins="https://imirante.com,https://m.imirante.com,http://homologacao.imirante.com,https://homologacao.imirante.com" # quem pode ler (lista completa)
+aws/deploy.sh TseEleicoes=6258,6260                  # só estas eleições (vazio = todas do pleito/turno)
+aws/deploy.sh FeedScheduleState=ENABLED              # liga o feed /eleicoes/ao-vivo (ver seção do feed)
 ```
 
 Parâmetros não informados mantêm o valor atual do stack — só passe o que quer mudar.
 
-## Operação
+## Feed /eleicoes/ao-vivo
+
+Página `/eleicoes/ao-vivo` do imirante.com (contrato v1 em `imirante/docs/apuracao-ao-vivo-feed.md`). Lê 4 arquivos agregados em `https://d3nthtia8j7edn.cloudfront.net/<FeedPrefixo>` (output `FeedUrl`; é o `APURACAO_FEED_URL` do site):
+
+| Arquivo | Conteúdo | Gravado por | Cache-Control |
+|---|---|---|---|
+| `agora.json` | Presidente: Brasil, 27 UFs + exterior (`ZZ`), candidatos | `coletor-tse-feed`, a cada ~15s | `max-age=5, s-maxage=5, swr=30, sie=600` |
+| `municipios-ma.json` | Presidente nos 217 municípios de `TseUf` | `coletor-tse-feed`, a cada ~15s | `max-age=10, s-maxage=5, swr=30, sie=600` |
+| `historico.json` | curva da apuração (ponto novo só quando `totalizadas` do BR ou MA muda; até 600 pontos, mantendo o 1º) | `coletor-tse-feed`, a cada ~15s | `max-age=5, s-maxage=5, swr=30, sie=600` |
+| `municipios-br.json` | Presidente nos 5.571 municípios (colunar, ordenado por código IBGE; sem exterior) | `coletor-tse-feed-municipios`, a cada ~1 min | `max-age=10, s-maxage=5, swr=30, sie=600` |
+| `fotos/<sqcand>.jpeg` | fotos dos candidatos, copiadas uma vez do TSE | `coletor-tse-feed` | `max-age=86400` |
+
+**Como funciona**
+
+- **Funções e locks próprios** (`_controle/feed.lock`, `_controle/feed-municipios.lock`): o espelho e o feed não dependem um do outro; a varredura lenta dos municípios nunca atrasa o ciclo rápido.
+- **Ciclo rápido** (`coletor-tse-feed`, 512 MB, timeout 60s): agendada a cada minuto, faz ciclos a cada 15s até 45s (4 por invocação). Cada ciclo baixa `br` + 28 UFs + 217 municípios do MA (~246 arquivos, 16 threads, timeout de 5s por arquivo, conexão persistente, gzip, `If-None-Match`/`If-Modified-Since`). Grava `municipios-ma.json` → `historico.json` → `agora.json` (**agora por último**: quem vê um `seq` novo encontra os outros já gravados). `seq` = epoch em ms do ciclo, igual nos três. Grava **a cada ciclo**, mesmo sem mudança no TSE (`gerado` e `seq` andam; a página detecta coletor parado pelo `seq`).
+- **Ciclo lento** (`coletor-tse-feed-municipios`, 512 MB, timeout 120s): baixa os 27 `{uf}-e{eleição}-ab.json` (por município: seções totalizadas e horário, sem votos) e só baixa o arquivo de município que mudou. Último valor bom + ETag de cada município ficam em `_controle/feed-municipios-<eleição>.json`.
+- **Falhas**: arquivo do TSE que falha usa o último valor bom (memória → arquivos já publicados, na Lambda fria), **nunca zero**; só entra zerado o que nunca foi baixado. Se o arquivo do **Brasil** falhar, o ciclo não grava nada. UF sem nenhum valor anterior também impede a gravação.
+- **Contrato**: os arquivos passam por `coletor/contrato.py` (JSON Schema + `totalizadas <= secoes`, votos de todos os candidatos, arrays do mesmo tamanho, 217/5.571 municípios, `seq` igual) **antes** de gravar; se falhar, nada é gravado e o anterior continua no ar (`erro_etapa: feed: validação do contrato`).
+- **Campos**: números do TSE convertidos para inteiros; `nulos` = `v.tvn` (inclui nulos técnicos); `eleito` = candidato com `e="s"` **e** `st` "Eleito"/"Matematicamente eleito" (no 1º turno, `e="s"` também marca quem foi ao 2º turno); `situacao` = `nao-iniciada` (0 totalizadas), `apurando`, `encerrada` (todas); `fonte_atualizado` = `dt`+`ht` do arquivo do Brasil; `nome` dos municípios vem da tabela do IBGE (o TSE manda em maiúsculas).
+- **Municípios**: código IBGE = campo `cdi` do `mun-e{eleição}-cm.json` do TSE (casa 1:1 com a API do IBGE — teste em `tests/test_contrato.py`). São **5.571**: o `mapa-br.json` do site tem 5.570 — falta Boa Esperança do Norte (MT, `5101837`), que fica sem desenho no mapa, mas os votos dele entram nos totais.
+- **Governador** (6260) não entra no feed v1 — continua só no espelho/índice. No 2º turno de 2026 o MA nem tem governador (6260 só tem AM, RN, DF, ES e AC).
+
+**Parâmetros do stack**
+
+| Parâmetro | Padrão | Uso |
+|---|---|---|
+| `TseEleicoes` | vazio | Códigos de eleição (vírgula). Trava extra contra suplementares/consultas do mesmo pleito. Vale para espelho e feed |
+| `FeedPrefixo` | `aovivo/2026/t2/` | Pasta do feed no bucket; o CloudFront só lê esta pasta (além do espelho) |
+| `FeedRecarregar` | vazio (`null`) | **Forçar reload dos leitores**: mude o valor (ex.: `FeedRecarregar=v2`); cada navegador recarrega uma vez, espalhado em 1 min |
+| `FeedAviso` | vazio (`null`) | **Aviso em destaque** na página (ex.: `FeedAviso="TSE com instabilidade"`); `FeedAviso=""` tira |
+| `FeedCores` | vazio | JSON `{"13":"#C0392B","22":"#2543F4"}`; vazio = a página escolhe |
+| `FeedScheduleState` | `DISABLED` | Liga/desliga os dois agendamentos do feed (independente do espelho) |
+| `FeedAlarme` | `DISABLED` | Alarme `coletor-tse-feed-parado` (só existe com o feed `ENABLED`) |
+| `FeedParadoSegundos` | `180` | Janela sem `agora.json` gravado que dispara o alarme |
+
+`FeedRecarregar`/`FeedAviso` mudam variável de ambiente da Lambda: valem a partir da próxima invocação (até ~1 min) depois do `deploy.sh`.
+
+### Checklist do 2º turno (25/10/2026)
+
+Antes (dias anteriores):
+
+1. Confirmar a Region do projeto em **AWS Settings > View all projects > Overview > Additional Info > Region** (`sa-east-1`) e o **limite de gastos** em **AWS Settings > Billing** (um limite baixo pausa o projeto no meio da apuração — ver custo abaixo).
+2. Conferir no `ele-c.json` oficial que 6258/6260 continuam no pleito 3221 com `t=2`.
+
+No dia (de manhã, para o feed já estar no ar quando o TSE publicar os arquivos zerados):
+
+```bash
+aws/deploy.sh TsePleito=3221 TseTurno=2 TseEleicoes=6258,6260 \
+  TseBaseUrl=https://resultados.tse.jus.br TseAmbiente=oficial \
+  ScheduleExpression="rate(1 minute)" ScheduleState=ENABLED \
+  FeedPrefixo=aovivo/2026/t2/ FeedScheduleState=ENABLED FeedAlarme=ENABLED
+```
+
+> ⚠️ **`TsePleito=3221` é obrigatório**: com o `3220` do 1º turno o coletor não acha nenhuma eleição do 2º turno (o checklist em `imirante/docs/apuracao-ao-vivo-feed.md` não tem esse parâmetro).
+
+Depois: `aws logs tail --region=sa-east-1 /aws/lambda/coletor-tse-feed --since 5m` deve mostrar `Feed gravado | seq ... | pst BR ...` a cada ~15s, e `curl -s -H "Origin: https://imirante.com" https://d3nthtia8j7edn.cloudfront.net/aovivo/2026/t2/agora.json | jq '{seq, turno, fonte_atualizado}'` responder. Se o TSE ainda não publicou os arquivos do 2º turno, o feed loga `TSE respondeu 404` e não grava — normal até a publicação (deixe `FeedAlarme=DISABLED` até lá para não alarmar).
+
+### Operação do feed
+
+```bash
+R=--region=sa-east-1
+aws/deploy.sh FeedScheduleState=DISABLED            # pausar o feed (espelho segue)
+aws/deploy.sh FeedScheduleState=ENABLED             # retomar
+aws/deploy.sh FeedRecarregar=$(date +%s)            # forçar reload da página nos leitores
+aws/deploy.sh FeedAviso="Apuração atrasada no TSE"  # aviso em destaque; FeedAviso="" remove
+aws lambda invoke $R --function-name coletor-tse-feed /dev/stdout              # rodar já
+aws logs tail $R /aws/lambda/coletor-tse-feed --follow                         # ao vivo
+aws logs tail $R /aws/lambda/coletor-tse-feed-municipios --since 10m           # varredura do Brasil
+```
+
+Modo local (sem AWS; dados reais do TSE, 1º turno por padrão):
+
+```bash
+uv run --no-project --python 3.14 python coletor/local.py --saida /tmp/feed              # 4 arquivos
+uv run --no-project --python 3.14 python coletor/local.py --saida /tmp/feed --sem-brasil # sem os 5.571
+```
+
+**Testes na AWS sem afetar o 2º turno**: rode com outro prefixo (ex.: `aws/deploy.sh FeedPrefixo=aovivo/teste/t1/ FeedScheduleState=ENABLED`, mantendo os parâmetros do TSE; **não** use `TseEleicoes` para isso — ele também filtra o espelho e tiraria cargos do `dados_eleicao.json`) e apague a pasta depois — o histórico e o estado são por prefixo/eleição, mas o `historico.json` do prefixo final deve começar limpo no dia (`aws s3 rm --recursive s3://raw-tse-data-2026/aovivo/teste/`).
+
+### Medições (1º turno oficial, 6257, 12 candidatos; a confirmar na Lambda)
+
+| | Ciclo rápido | Varredura do Brasil |
+|---|---|---|
+| Requisições ao TSE | 247 por ciclo (~990/min com 4 ciclos); 2º ciclo em diante: GET condicional (304) | 1ª: ~5.600; seguintes: 29 + só os municípios que mudaram (pico teórico ~5.600/min no meio da apuração) |
+| Duração | 2,5–6s por ciclo | 1ª: 37s; sem mudança: 1,6s |
+| Memória | — | 116 MB (pico) |
+
+Pico de requisições ao TSE na apuração: ~1.000/min (rápido) + até ~5.600/min (lento) + ~5/min do espelho.
+
+### Concorrência (limite da conta: 10)
+
+Cada função agendada tem no máximo 2 execuções ao mesmo tempo (uma rodando + uma que acha o lock ocupado e sai em < 1s): espelho 2 + feed 2 + municípios 2 = **6**, mais o notificador (1 por alarme, até 3 juntos) = **9 no pior caso**. Normal: 3–4. Evite `aws lambda invoke` manual durante incidente.
+
+### Custo estimado da noite (preços sa-east-1 / América do Sul, Price List API em 2026-10-13)
+
+- **AWS (coletor)**: Lambda arm64 $0,0000133/GB-s → feed ~1.500 GB-s/h + municípios ~1.200 GB-s/h ≈ **$0,04/h**; S3 PUT ($0,007/1.000) ~1.100/h ≈ $0,01/h; logs < $0,05 na noite. **Menos de $1 na noite toda.**
+- **CloudFront (leitores)** — o que pesa: $0,0220/10.000 requisições HTTPS + $0,110/GB. Por leitor com a página aberta, por hora: ~540 requisições + ~6–10 MB (gzip; `municipios-br.json` ~64 KB é ~75% do volume) ≈ **$0,002–0,003 por leitor-hora**. Ex.: 10 mil leitores simultâneos por 4h ≈ **$80–120**; 50 mil ≈ $400–600.
+- Para reduzir: a página relê `municipios-br.json` a cada ~30s porque compara o `seq` dele com o do `agora.json` (que nunca são iguais); comparar com o último `seq` do próprio `municipios-br.json` cortaria cerca de metade desse tráfego (mudança no repo do site).
+
 
 ```bash
 R=--region=sa-east-1
@@ -102,9 +212,10 @@ Referência rápida (conta `281466185599`, região `sa-east-1`):
 | Lambda | `coletor-tse` |
 | Log group | `/aws/lambda/coletor-tse` (retenção 30 dias) |
 | Agendamento | EventBridge Scheduler `coletor-tse` — `rate(1 minute)` |
-| Alarmes | `coletor-tse-erros`, `coletor-tse-dados-parados` (`sa-east-1`); `coletor-tse-cloudfront-4xx`, `coletor-tse-cloudfront-5xx` (`us-east-1`, stack `coletor-tse-borda`) |
+| Lambdas do feed | `coletor-tse-feed` (rápido), `coletor-tse-feed-municipios` (municípios do Brasil) — log groups `/aws/lambda/coletor-tse-feed*` |
+| Alarmes | `coletor-tse-erros`, `coletor-tse-dados-parados`, `coletor-tse-feed-parado` (`sa-east-1`); `coletor-tse-cloudfront-4xx`, `coletor-tse-cloudfront-5xx` (`us-east-1`, stack `coletor-tse-borda`) |
 | Tópico de alertas | SNS `coletor-tse-alertas` (`sa-east-1`) e `coletor-tse-alertas-cloudfront` (`us-east-1`) — os dois acionam o mesmo notificador |
-| Métrica customizada | `ColetorTSE/ColetasCompletas` |
+| Métricas customizadas | `ColetorTSE/ColetasCompletas`, `ColetorTSE/FeedGravado`, `ColetorTSE/FeedMunicipiosGravado` |
 | Notificador | Lambda `coletor-tse-telegram` (só com Telegram configurado) |
 | Bucket | `raw-tse-data-2026` |
 | CloudFront | `E3QGP1X906YZKI` — `https://d3nthtia8j7edn.cloudfront.net` |
@@ -153,7 +264,10 @@ Dispara quando a métrica `Errors` da Lambda é ≥ 1 em 5 minutos (config do TS
 **Alarme `coletor-tse-dados-parados`** · [abrir](https://sa-east-1.console.aws.amazon.com/cloudwatch/home?region=sa-east-1#alarmsV2:alarm/coletor-tse-dados-parados)
 Dispara quando passa `DadosParadosSegundos` (padrão 10 min) **sem nenhuma coleta completa**. Pega o que o alarme de erros não vê: coletor que parou de rodar, lock preso (execuções puladas), falhas seguidas e cargo que falha toda vez (coleta `partial`). A métrica `ColetorTSE/ColetasCompletas` vem de um filtro no log (`coleta_status = "success"`). O alarme só existe com o agendamento `ENABLED`. Ele **não** dispara quando o TSE simplesmente não publicou nada novo: coleta sem mudança também é completa.
 
-Os dois alarmes avisam quando disparam e quando voltam ao normal, pelo tópico SNS `coletor-tse-alertas` (Telegram e/ou e-mail).
+**Alarme `coletor-tse-feed-parado`** · [abrir](https://sa-east-1.console.aws.amazon.com/cloudwatch/home?region=sa-east-1#alarmsV2:alarm/coletor-tse-feed-parado)
+Dispara quando passa `FeedParadoSegundos` (padrão 3 min) **sem nenhum `agora.json` gravado** (métrica `ColetorTSE/FeedGravado`, filtro `feed_status = "gravado"` no log do `coletor-tse-feed`). Só existe com `FeedScheduleState=ENABLED` e `FeedAlarme=ENABLED`. No Telegram, a mensagem traz os ciclos gravados/com erro na janela, os erros agrupados (`erro_etapa` começa com `feed:`) e o que fazer.
+
+Os alarmes avisam quando disparam e quando voltam ao normal, pelo tópico SNS `coletor-tse-alertas` (Telegram e/ou e-mail).
 
 **Agendamento (EventBridge Scheduler)** · [abrir](https://sa-east-1.console.aws.amazon.com/scheduler/home?region=sa-east-1#schedules/default/coletor-tse)
 Mostra se está `ENABLED` e a frequência. Sem retry: execução perdida só é compensada pela próxima.
@@ -213,6 +327,12 @@ Limites ajustáveis nos parâmetros `Limite4xxPercent`, `Limite5xxPercent` e `Mi
 | ERROR | `coleta dos cargos: nenhum cargo foi coletado ...` | **Falha total**: todos os cargos falharam |
 | ERROR | `gravação do índice no S3: ...` / `lock no S3: ...` / `leitura do índice anterior: ...` | **Falha total** por erro no S3 |
 | ERROR | `liberação do lock: ...` | Lock ficou no S3; a próxima execução pode ser pulada até ele expirar |
+| INFO | `Feed gravado \| seq N \| pst BR 0.4213 \| 0 falha(s) \| 247 req (240 sem mudança) \| 2534 ms` | Ciclo do feed gravou os 3 arquivos (`feed_status: gravado`) |
+| WARNING | `Feed: N arquivo(s) do TSE falharam neste ciclo — usando o último valor bom: Presidente (SP), ...` | Feed gravado com o valor anterior desses arquivos |
+| ERROR | `feed: download do arquivo do TSE [Presidente (BR)]: ...` | Sem o Brasil o ciclo não grava; a página segue com o anterior |
+| ERROR | `feed: validação do contrato: ...` | Arquivo montado não passou no contrato; nada gravado (formato do TSE mudou?) |
+| ERROR | `feed: configuração do TSE (ele-c.json): esperava 1 eleição de Presidente ...` | `TsePleito`/`TseTurno`/`TseEleicoes` não batem com o `ele-c.json` |
+| INFO | `Feed municípios gravado \| seq N \| 5571 municípios \| ...` | Varredura do Brasil gravou `municipios-br.json` (com duração, requisições e memória) |
 
 Tipos de erro (`erro_tipo`): `tse_indisponivel` (timeout, rede, 429, 5xx), `tse_nao_encontrado` (404, turno/ambiente errado), `tse_conteudo_invalido` (JSON inválido ou formato mudou), `s3`, `inesperado`.
 

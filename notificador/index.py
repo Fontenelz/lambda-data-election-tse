@@ -26,6 +26,7 @@ CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 TOKEN_PARAM = os.environ["TELEGRAM_TOKEN_PARAM"]
 REGION = os.environ["AWS_REGION"]
 COLETOR_LOG_GROUP = os.environ.get("COLETOR_LOG_GROUP", "/aws/lambda/coletor-tse")
+FEED_LOG_GROUP = os.environ.get("FEED_LOG_GROUP", "/aws/lambda/coletor-tse-feed")
 
 # Brasil não tem mais horário de verão
 BRASILIA = timezone(timedelta(hours=-3), "Brasília")
@@ -49,6 +50,12 @@ ALARMES = {
         "ALARM": ("🟠", "Dados do site parados",
                   "Nenhuma coleta completa em {janela}. O site pode estar mostrando resultados atrasados."),
         "OK": ("✅", "Dados do site voltaram a atualizar", "As coletas completas voltaram."),
+    },
+    "coletor-tse-feed-parado": {
+        "ALARM": ("🟠", "Apuração ao vivo parada",
+                  "Nenhum agora.json gravado em {janela}. A página /eleicoes/ao-vivo continua com os últimos "
+                  "números publicados e mostra \"sem novidades\" aos leitores."),
+        "OK": ("✅", "Apuração ao vivo voltou a atualizar", "O feed voltou a gravar o agora.json."),
     },
     "coletor-tse-cloudfront-4xx": {
         "ALARM": ("🟠", "CloudFront recusando requisições (4xx)",
@@ -91,6 +98,38 @@ DICAS = {
                  "(aws scheduler get-schedule --name coletor-tse) e se há throttles na Lambda.",
     "parcial": "Algum cargo falha em toda execução; os demais seguem atualizando.",
 }
+
+# De onde vem o contexto de cada alarme: logs, campo de status e métrica de
+# sucesso. Alarmes sem entrada em FONTE_DO_ALARME usam o coletor (espelho).
+FONTES = {
+    "coletor": {
+        "log_group": COLETOR_LOG_GROUP, "campo": "coleta_status", "metrica": "ColetasCompletas",
+        "quem": "O coletor", "logs": "Logs do coletor", "ultima": "Última coleta completa",
+        "sem_ultima": "Nenhuma coleta completa nas últimas 24h",
+        "rotulos": (("success", "completa(s)"), ("partial", "parcial(is)"), ("error", "com falha total"),
+                    ("skipped", "pulada(s) por lock"), ("quebrou", "quebrada(s)")),
+        "dicas": {},
+    },
+    "feed": {
+        "log_group": FEED_LOG_GROUP, "campo": "feed_status", "metrica": "FeedGravado",
+        "quem": "O feed da apuração ao vivo", "logs": "Logs do feed", "ultima": "Último agora.json gravado",
+        "sem_ultima": "Nenhum agora.json gravado nas últimas 24h",
+        "rotulos": (("gravado", "ciclo(s) gravado(s)"), ("erro", "ciclo(s) com erro"),
+                    ("skipped", "execução(ões) pulada(s) por lock"), ("quebrou", "quebrada(s)")),
+        "dicas": {
+            "tse_nao_encontrado": "O arquivo não existe no TSE. Confira TsePleito, TseTurno e TseEleicoes "
+                                  "(2º turno: TsePleito=3221 TseTurno=2 TseEleicoes=6258,6260) e TseAmbiente/TseBaseUrl.",
+            "tse_conteudo_invalido": "O arquivo do TSE não passou no contrato do feed (veja o erro acima): nada foi "
+                                     "gravado e a página segue com o anterior. Se persistir, o formato mudou.",
+            "inesperado": "Erro no código do feed (coletor/feed.py). Veja os logs e o último deploy.",
+            "lock": "Execuções puladas porque outra ainda estava rodando ou o lock ficou preso. Ele expira "
+                    "sozinho em 90s; se persistir, apague _controle/feed.lock no bucket.",
+            "nao_rodou": "O feed não rodou. Veja se FeedScheduleState está ENABLED "
+                         "(aws scheduler get-schedule --name coletor-tse-feed) e se há throttles na Lambda.",
+        },
+    },
+}
+FONTE_DO_ALARME = {"coletor-tse-feed-parado": "feed"}
 
 # ordem de prioridade quando há mais de uma causa
 PRIORIDADE_DICAS = ["quebrou", "s3", "inesperado", "tse_nao_encontrado", "tse_conteudo_invalido",
@@ -140,19 +179,22 @@ def cloudwatch_em(regiao):
     return _cloudwatch_por_regiao[regiao]
 
 
-def link_logs():
+def link_logs(log_group=COLETOR_LOG_GROUP):
     # o console usa "$25" no lugar de "%" dentro do fragmento
-    nome = urllib.parse.quote(urllib.parse.quote(COLETOR_LOG_GROUP, safe=""), safe="").replace("%", "$")
+    nome = urllib.parse.quote(urllib.parse.quote(log_group, safe=""), safe="").replace("%", "$")
     return link_console(f"logsV2:log-groups/log-group/{nome}")
 
 
 # --- Contexto a partir dos logs e métricas do coletor ------------------------
 
-def eventos_do_coletor(inicio, fim):
-    padrao = ('{ ($.level = "ERROR") || ($.coleta_status = "success") || ($.coleta_status = "partial") '
-              '|| ($.coleta_status = "skipped") || ($.type = "platform.report") }')
+def eventos_do_coletor(inicio, fim, fonte=FONTES["coletor"]):
+    campo = fonte["campo"]
+    # status de falha já vêm com level ERROR; "quebrou" é deduzido do platform.report
+    padrao = ('{ ($.level = "ERROR") || ' + " || ".join(f'($.{campo} = "{status}")' for status, _ in fonte["rotulos"]
+                                                        if status not in ("error", "erro", "quebrou"))
+              + ' || ($.type = "platform.report") }')
     params = {
-        "logGroupName": COLETOR_LOG_GROUP,
+        "logGroupName": fonte["log_group"],
         "startTime": int(inicio.timestamp() * 1000),
         "endTime": int(fim.timestamp() * 1000),
         "filterPattern": padrao,
@@ -171,13 +213,13 @@ def eventos_do_coletor(inicio, fim):
     return eventos
 
 
-def resumir(eventos):
+def resumir(eventos, campo="coleta_status"):
     execucoes = Counter()
     erros = Counter()
     tipos = Counter()
     for e in eventos:
-        if e.get("coleta_status"):
-            execucoes[e["coleta_status"]] += 1
+        if e.get(campo):
+            execucoes[e[campo]] += 1
         if e.get("erro_motivo"):
             erros[(e.get("erro_etapa"), e.get("erro_cargo"), e["erro_motivo"])] += 1
             tipos[e.get("erro_tipo") or "inesperado"] += 1
@@ -195,12 +237,12 @@ def resumir(eventos):
     return execucoes, erros, tipos
 
 
-def ultima_coleta_completa(ate):
+def ultima_coleta_completa(ate, metrica="ColetasCompletas"):
     resposta = cloudwatch.get_metric_data(
         MetricDataQueries=[{
             "Id": "completas",
             "MetricStat": {
-                "Metric": {"Namespace": "ColetorTSE", "MetricName": "ColetasCompletas"},
+                "Metric": {"Namespace": "ColetorTSE", "MetricName": metrica},
                 "Period": 60,
                 "Stat": "Sum",
             },
@@ -232,22 +274,19 @@ def inicio_do_problema(nome_alarme, ate, regiao=REGION):
     return None
 
 
-def linhas_de_contexto(momento, janela):
+def linhas_de_contexto(momento, janela, fonte=FONTES["coletor"]):
     linhas = []
     dicas = set()
 
-    execucoes, erros, tipos = resumir(eventos_do_coletor(momento - janela, momento))
+    execucoes, erros, tipos = resumir(eventos_do_coletor(momento - janela, momento, fonte), fonte["campo"])
     dicas.update(tipos)
 
     total = sum(execucoes.values())
     if total == 0 and not erros:
         dicas.add("nao_rodou")
-        linhas.append(f"• O coletor <b>não rodou</b> nos últimos {duracao(janela.total_seconds())}.")
+        linhas.append(f"• {fonte['quem']} <b>não rodou</b> nos últimos {duracao(janela.total_seconds())}.")
     else:
-        partes = [f"{n} {rotulo}" for chave, rotulo in (
-            ("success", "completa(s)"), ("partial", "parcial(is)"), ("error", "com falha total"),
-            ("skipped", "pulada(s) por lock"), ("quebrou", "quebrada(s)"),
-        ) if (n := execucoes.get(chave))]
+        partes = [f"{n} {rotulo}" for chave, rotulo in fonte["rotulos"] if (n := execucoes.get(chave))]
         linhas.append(f"• Execuções em {duracao(janela.total_seconds())}: {', '.join(partes) or 'nenhuma'}")
         if execucoes.get("skipped", 0) > total / 2:
             dicas.add("lock")
@@ -263,18 +302,18 @@ def linhas_de_contexto(momento, janela):
         if len(erros) > MAX_LINHAS_ERRO:
             linhas.append(f"• … e mais {len(erros) - MAX_LINHAS_ERRO} tipo(s) de erro")
 
-    ultima = ultima_coleta_completa(momento)
+    ultima = ultima_coleta_completa(momento, fonte["metrica"])
     linhas.append("")
     if ultima:
-        linhas.append(f"🕒 Última coleta completa: <b>{hora(ultima)}</b> "
+        linhas.append(f"🕒 {fonte['ultima']}: <b>{hora(ultima)}</b> "
                       f"(há {duracao((momento - ultima).total_seconds())})")
     else:
-        linhas.append("🕒 Nenhuma coleta completa nas últimas 24h")
+        linhas.append(f"🕒 {fonte['sem_ultima']}")
 
     dica = next((d for d in PRIORIDADE_DICAS if d in dicas), None)
     if dica:
         linhas.append("")
-        linhas.append(f"🔎 <b>O que fazer:</b> {html.escape(DICAS[dica])}")
+        linhas.append(f"🔎 <b>O que fazer:</b> {html.escape(fonte['dicas'].get(dica, DICAS[dica]))}")
     return linhas
 
 
@@ -297,6 +336,7 @@ def formatar(mensagem_sns):
     gatilho = alarme.get("Trigger") or {}
     janela = timedelta(seconds=int(gatilho.get("Period", 300)) * int(gatilho.get("EvaluationPeriods", 1)))
 
+    fonte = FONTES[FONTE_DO_ALARME.get(nome, "coletor")]
     icone, titulo, impacto = ALARMES.get(nome, {}).get(estado) or (
         {"ALARM": "🔴", "OK": "✅"}.get(estado, "⚪"), f"{nome}: {estado}", alarme.get("AlarmDescription") or "",
     )
@@ -307,7 +347,7 @@ def formatar(mensagem_sns):
         if estado == "ALARM" and nome in DICAS_CLOUDFRONT:
             linhas += ["", f"🔎 <b>O que fazer:</b> {html.escape(DICAS_CLOUDFRONT[nome])}"]
         elif estado == "ALARM":
-            linhas += [""] + linhas_de_contexto(momento, janela)
+            linhas += [""] + linhas_de_contexto(momento, janela, fonte)
         elif estado == "OK" and alarme.get("OldStateValue") == "ALARM":
             inicio = inicio_do_problema(nome, momento, regiao)
             if inicio:
@@ -320,7 +360,7 @@ def formatar(mensagem_sns):
     if nome in DICAS_CLOUDFRONT:
         detalhes = f'<a href="{link_cloudfront()}">Monitoramento do CloudFront</a>'
     else:
-        detalhes = f'<a href="{link_logs()}">Logs do coletor</a>'
+        detalhes = f'<a href="{link_logs(fonte["log_group"])}">{fonte["logs"]}</a>'
     linhas += [
         "",
         f'<a href="{link_console("alarmsV2:alarm/" + urllib.parse.quote(nome), regiao)}">Alarme</a> · '

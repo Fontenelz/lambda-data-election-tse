@@ -37,6 +37,9 @@ TURNO = os.environ.get("TSE_TURNO", "1").strip()
 # ele-c.json oficial traz também pleitos antigos e eleições suplementares
 # (ex.: governador de RR), que não podem entrar na coleta.
 PLEITOS = {p.strip() for p in os.environ.get("TSE_PLEITO", "3220").split(",") if p.strip()}
+# códigos de eleição a coletar (vazio = todas as do pleito/turno). Trava extra:
+# no 2º turno o pleito 3221 também tem suplementares e consultas populares.
+ELEICOES = {e.strip() for e in os.environ.get("TSE_ELEICOES", "").split(",") if e.strip()}
 UF = os.environ.get("TSE_UF", "ma").lower()
 
 BUCKET_NAME = os.environ["BUCKET_NAME"]
@@ -187,42 +190,43 @@ def extrair_timestamp_geracao(dados):
     return None
 
 
-def adquirir_lock(dono):
+def adquirir_lock(dono, chave=LOCK_KEY, ttl=LOCK_TTL_SEGUNDOS):
     # Cria o lock só se ele não existir (If-None-Match: *). Se existir mas
     # estiver velho demais, assume o lock sobrescrevendo com If-Match no ETag
     # lido — se outra execução fizer o mesmo ao mesmo tempo, só uma vence.
+    # chave/ttl: o feed usa locks próprios, para não travar o espelho.
     corpo = json.dumps({"dono": dono, "criado_em": agora_iso()})
     try:
-        s3.put_object(Bucket=BUCKET_NAME, Key=LOCK_KEY, Body=corpo, IfNoneMatch="*")
+        s3.put_object(Bucket=BUCKET_NAME, Key=chave, Body=corpo, IfNoneMatch="*")
         return True
     except ClientError as error:
         if error.response["Error"]["Code"] not in ("PreconditionFailed", "ConditionalRequestConflict"):
             raise
 
     try:
-        atual = s3.head_object(Bucket=BUCKET_NAME, Key=LOCK_KEY)
+        atual = s3.head_object(Bucket=BUCKET_NAME, Key=chave)
     except ClientError:
         return False  # lock sumiu entre as chamadas; a próxima execução pega
 
     idade = (datetime.now(timezone.utc) - atual["LastModified"]).total_seconds()
-    if idade < LOCK_TTL_SEGUNDOS:
+    if idade < ttl:
         return False
 
     logger.warning("Lock abandonado há %ds, assumindo", int(idade))
     try:
-        s3.put_object(Bucket=BUCKET_NAME, Key=LOCK_KEY, Body=corpo, IfMatch=atual["ETag"])
+        s3.put_object(Bucket=BUCKET_NAME, Key=chave, Body=corpo, IfMatch=atual["ETag"])
         return True
     except ClientError:
         return False
 
 
-def liberar_lock():
+def liberar_lock(chave=LOCK_KEY, ttl=LOCK_TTL_SEGUNDOS):
     try:
-        s3.delete_object(Bucket=BUCKET_NAME, Key=LOCK_KEY)
+        s3.delete_object(Bucket=BUCKET_NAME, Key=chave)
     except (ClientError, BotoCoreError) as error:
         tipo, motivo = descrever_erro(error)
         registrar_erro("liberação do lock", tipo,
-                       f"{motivo} — próximas execuções podem ser puladas por até {LOCK_TTL_SEGUNDOS}s")
+                       f"{motivo} — próximas execuções podem ser puladas por até {ttl}s")
 
 
 def carregar_estado_anterior():
@@ -326,6 +330,8 @@ def listar_alvos(config):
             # str(): o TSE pode mandar o turno como número ou texto
             if str(eleicao.get("t", TURNO)) != TURNO:
                 continue
+            if ELEICOES and str(eleicao["cd"]) not in ELEICOES:
+                continue
 
             # nas eleições gerais o índice traz abr.cd = "br" e a pasta/UF é
             # decidida pelo código do cargo; abrangência de outra UF (eleição
@@ -384,8 +390,9 @@ def coletar(prazo=None):
     if not alvos:
         raise ColetaFalhou(
             "configuração do TSE (ele-c.json)", "tse_nao_encontrado",
-            f"nenhuma eleição do pleito {','.join(sorted(PLEITOS)) or '(todos)'} / turno {TURNO} "
-            "com os cargos cobertos — confira TsePleito/TseTurno/TseAmbiente",
+            f"nenhuma eleição do pleito {','.join(sorted(PLEITOS)) or '(todos)'} / turno {TURNO}"
+            f"{' / eleições ' + ','.join(sorted(ELEICOES)) if ELEICOES else ''} "
+            "com os cargos cobertos — confira TsePleito/TseTurno/TseEleicoes/TseAmbiente",
         )
 
     resultados_finais = []

@@ -1,0 +1,3 @@
+# Cópia exata do coletor/index.py em produção (Lambda coletor-tse, modificada
+# em 2026-10-03), baixada com aws lambda get-function em 2026-10-13. Base do
+# teste de não regressão: o espelho novo tem que gravar o mesmo que este.

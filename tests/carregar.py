@@ -40,14 +40,30 @@ def _garantir_boto3():
 
 
 def carregar(pasta, ambiente):
+    return carregar_arquivo(RAIZ / pasta / "index.py", f"{pasta}_index", ambiente)
+
+
+def carregar_arquivo(caminho, nome, ambiente):
     _garantir_boto3()
-    nome = f"{pasta}_index"
-    spec = importlib.util.spec_from_file_location(nome, RAIZ / pasta / "index.py")
+    spec = importlib.util.spec_from_file_location(nome, caminho)
     modulo = importlib.util.module_from_spec(spec)
     with mock.patch.dict(os.environ, ambiente), mock.patch("boto3.client", return_value=mock.MagicMock()):
         spec.loader.exec_module(modulo)
     sys.modules[nome] = modulo
     return modulo
+
+
+def carregar_feed(ambiente):
+    # feed.py importa "index" e "contrato" pelo nome, como na Lambda (raiz do
+    # zip = coletor/). Recarrega os três com o ambiente pedido.
+    _garantir_boto3()
+    pasta = str(RAIZ / "coletor")
+    if pasta not in sys.path:
+        sys.path.insert(0, pasta)
+    for nome in ("feed", "index", "contrato"):
+        sys.modules.pop(nome, None)
+    with mock.patch.dict(os.environ, ambiente), mock.patch("boto3.client", return_value=mock.MagicMock()):
+        return importlib.import_module("feed")
 
 
 def client_error(codigo, operacao="Operacao"):

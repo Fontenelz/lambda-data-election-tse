@@ -147,5 +147,50 @@ class Enviar(unittest.TestCase):
         notificador.time.sleep.assert_called_once_with(3)
 
 
+class AlarmeDoFeed(unittest.TestCase):
+    def setUp(self):
+        self.logs = mock.patch.object(notificador, "logs").start()
+        self.cloudwatch = mock.patch.object(notificador, "cloudwatch").start()
+        self.addCleanup(mock.patch.stopall)
+        self.cloudwatch.get_metric_data.return_value = {"MetricDataResults": [{"Timestamps": [], "Values": []}]}
+
+    def eventos(self, *eventos):
+        self.logs.filter_log_events.return_value = {"events": [{"message": json.dumps(e)} for e in eventos]}
+
+    def test_le_os_logs_e_a_metrica_do_feed(self):
+        self.eventos({"feed_status": "gravado"},
+                     {"level": "ERROR", "feed_status": "erro", "erro_etapa": "feed: validação do contrato",
+                      "erro_tipo": "tse_conteudo_invalido", "erro_motivo": "agora.uf.SP: totalizadas > secoes"})
+        texto = notificador.formatar(alarme("coletor-tse-feed-parado", "ALARM"))
+        self.assertIn("Apuração ao vivo parada", texto)
+        self.assertIn("1 ciclo(s) gravado(s), 1 ciclo(s) com erro", texto)
+        self.assertIn("agora.uf.SP: totalizadas &gt; secoes", texto)
+        self.assertIn("não passou no contrato do feed", texto)
+        self.assertIn("Nenhum agora.json gravado nas últimas 24h", texto)
+        self.assertIn("Logs do feed", texto)
+        chamada = self.logs.filter_log_events.call_args.kwargs
+        self.assertEqual(chamada["logGroupName"], "/aws/lambda/coletor-tse-feed")
+        self.assertIn('$.feed_status = "gravado"', chamada["filterPattern"])
+        metrica = self.cloudwatch.get_metric_data.call_args.kwargs["MetricDataQueries"][0]["MetricStat"]["Metric"]
+        self.assertEqual(metrica["MetricName"], "FeedGravado")
+
+    def test_feed_que_nao_rodou_aponta_o_agendamento_do_feed(self):
+        self.eventos()
+        texto = notificador.formatar(alarme("coletor-tse-feed-parado", "ALARM"))
+        self.assertIn("O feed da apuração ao vivo <b>não rodou</b>", texto)
+        self.assertIn("FeedScheduleState", texto)
+
+    def test_alarmes_do_coletor_continuam_iguais(self):
+        self.eventos()
+        texto = notificador.formatar(alarme("coletor-tse-dados-parados", "ALARM"))
+        self.assertIn("O coletor <b>não rodou</b>", texto)
+        self.assertIn("Nenhuma coleta completa nas últimas 24h", texto)
+        self.assertIn("aws scheduler get-schedule --name coletor-tse)", texto)
+        self.assertEqual(self.logs.filter_log_events.call_args.kwargs["logGroupName"], "/aws/lambda/coletor-tse")
+        self.assertEqual(self.logs.filter_log_events.call_args.kwargs["filterPattern"],
+                         '{ ($.level = "ERROR") || ($.coleta_status = "success") || ($.coleta_status = "partial") '
+                         '|| ($.coleta_status = "skipped") || ($.type = "platform.report") }')  # igual ao de produção
+
+
 if __name__ == "__main__":
     unittest.main()

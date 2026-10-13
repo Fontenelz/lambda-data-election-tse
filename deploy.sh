@@ -13,6 +13,13 @@ trap 'rm -rf "$BUILD"' EXIT
 OVERRIDES=()
 [ $# -gt 0 ] && OVERRIDES=(--parameter-overrides "$@")
 
+# não publica código com teste quebrado (SEM_TESTES=1 pula, só em emergência)
+if [ "${SEM_TESTES:-0}" != "1" ]; then
+  echo "==> Testes"
+  if command -v python3 >/dev/null; then PY=(python3); else PY=(uv run --no-project --python 3.14 python); fi
+  (cd "$DIR" && "${PY[@]}" -m unittest discover -s tests -q)
+fi
+
 echo "==> Infraestrutura (stack $STACK em $REGION)"
 aws cloudformation deploy \
   --region "$REGION" \
@@ -22,13 +29,17 @@ aws cloudformation deploy \
   --no-fail-on-empty-changeset \
   "${OVERRIDES[@]}"
 
-echo "==> Código da Lambda"
-FUNCTION=$(aws cloudformation describe-stacks --region "$REGION" --stack-name "$STACK" \
-  --query "Stacks[0].Outputs[?OutputKey=='FunctionName'].OutputValue" --output text)
-(cd "$DIR/coletor" && zip -q -r "$BUILD/coletor.zip" . -x '__pycache__/*')
-aws lambda update-function-code --region "$REGION" --function-name "$FUNCTION" \
-  --zip-file "fileb://$BUILD/coletor.zip" --query 'LastUpdateStatus' --output text
-aws lambda wait function-updated-v2 --region "$REGION" --function-name "$FUNCTION"
+# mesmo zip para o espelho e as duas funções do feed (handlers diferentes);
+# local.py é só o modo CLI
+(cd "$DIR/coletor" && zip -q -r "$BUILD/coletor.zip" . -x '*__pycache__*' -x 'local.py')
+for SAIDA in FunctionName FeedFunctionName FeedMunicipiosFunctionName; do
+  FUNCTION=$(aws cloudformation describe-stacks --region "$REGION" --stack-name "$STACK" \
+    --query "Stacks[0].Outputs[?OutputKey=='$SAIDA'].OutputValue" --output text)
+  echo "==> Código da Lambda $FUNCTION"
+  aws lambda update-function-code --region "$REGION" --function-name "$FUNCTION" \
+    --zip-file "fileb://$BUILD/coletor.zip" --query 'LastUpdateStatus' --output text
+  aws lambda wait function-updated-v2 --region "$REGION" --function-name "$FUNCTION"
+done
 
 # notificador só existe quando TelegramChatId está configurado
 NOTIFIER=$(aws cloudformation describe-stacks --region "$REGION" --stack-name "$STACK" \
