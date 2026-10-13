@@ -328,6 +328,49 @@ class CicloMunicipios(Base):
         self.assertEqual(resultado["baixados"], 0)  # 1º turno: todos já 100% totalizados
 
 
+class LimiteDeTaxa(Base):
+    URL_BR = f"{ELE}/dados/br/br-c0001-e006257-u.json"
+
+    def test_429_nao_e_repetido_e_pausa_as_proximas(self):
+        self.tse.handler.falhas[self.URL_BR] = 429
+        cliente = self.feed.ClienteTSE()
+        with mock.patch.object(self.feed, "FEED_PAUSA_429", 1.0):
+            with self.assertRaises(self.feed.urllib.error.HTTPError):
+                cliente.baixar(f"{self.tse.url}/{self.URL_BR}")
+            self.assertEqual((cliente.requisicoes, cliente.limitadas), (1, 1))
+            del self.tse.handler.falhas[self.URL_BR]
+            inicio = time.monotonic()
+            cliente.baixar(f"{self.tse.url}/{self.URL_BR}")
+        self.assertGreaterEqual(time.monotonic() - inicio, 0.9)  # esperou a pausa
+
+    def test_respeita_requisicoes_por_segundo(self):
+        cliente = self.feed.ClienteTSE(por_segundo=20)
+        inicio = time.monotonic()
+        for _ in range(6):
+            cliente.baixar(f"{self.tse.url}/{self.URL_BR}", guardar=False)
+        self.assertGreaterEqual(time.monotonic() - inicio, 0.25)  # 5 intervalos de 50ms
+
+    def test_sem_vez_antes_do_prazo_vira_prazo_esgotado(self):
+        cliente = self.feed.ClienteTSE(por_segundo=1)
+        cliente.baixar(f"{self.tse.url}/{self.URL_BR}", guardar=False)
+        with self.assertRaises(self.coletor.PrazoEsgotado):
+            cliente.baixar(f"{self.tse.url}/{self.URL_BR}", prazo=time.monotonic() + 1.5, guardar=False)
+
+    def test_varredura_adia_o_que_nao_cabe_e_termina_depois(self):
+        self.tse.editar(f"{ELE}/config/mun-e006257-cm.json",
+                        lambda d: d.update(abr=[a for a in d["abr"] if a["cd"] in ("ma", "zz")]))
+        cliente = self.feed.ClienteTSE(por_segundo=100)
+        municipios = self.feed.FeedMunicipios(self.destino, cliente, self.config)
+        primeira = municipios.executar(prazo=time.monotonic() + 2.5)
+        self.assertEqual(primeira["falhas"], [])
+        self.assertGreater(primeira["adiados"], 0)
+        self.assertEqual(primeira["baixados"] + primeira["adiados"], 217)
+        segunda = municipios.executar(prazo=time.monotonic() + 30)
+        self.assertEqual((segunda["baixados"], segunda["adiados"]), (primeira["adiados"], 0))
+        doc = self.ler("municipios-br.json")
+        self.assertTrue(all(t > 0 for t in doc["totalizadas"]))
+
+
 class Handlers(Base):
     def setUp(self):
         super().setUp()

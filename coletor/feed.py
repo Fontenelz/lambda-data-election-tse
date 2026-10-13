@@ -55,7 +55,13 @@ FEED_JANELA = float(os.environ.get("FEED_JANELA_SEGUNDOS", "45"))
 # reservado no fim da execução para gravar no S3 e liberar o lock
 FEED_MARGEM = float(os.environ.get("FEED_MARGEM_SEGUNDOS", "5"))
 FEED_THREADS = int(os.environ.get("FEED_THREADS", "16"))
-FEED_MUN_THREADS = int(os.environ.get("FEED_MUN_THREADS", "32"))
+FEED_MUN_THREADS = int(os.environ.get("FEED_MUN_THREADS", "8"))
+# teto de requisições/s da varredura dos municípios: com 32 threads sem teto o
+# TSE respondeu 429 (teste na AWS, 2026-10-13); o que não couber fica para a
+# próxima execução
+FEED_MUN_REQ_POR_SEGUNDO = float(os.environ.get("FEED_MUN_REQ_POR_SEGUNDO", "25"))
+# 429 sem Retry-After: pausa todas as threads por isso (teto de 30s)
+FEED_PAUSA_429 = float(os.environ.get("FEED_PAUSA_429_SEGUNDOS", "5"))
 FEED_HTTP_TIMEOUT = float(os.environ.get("FEED_HTTP_TIMEOUT", "5"))
 FEED_HTTP_TENTATIVAS = int(os.environ.get("FEED_HTTP_TENTATIVAS", "3"))
 FEED_HISTORICO_MAX = int(os.environ.get("FEED_HISTORICO_MAX", "600"))
@@ -125,18 +131,44 @@ class ClienteTSE:
     # Manda If-None-Match/If-Modified-Since com o que tiver do arquivo: 304
     # devolve o último conteúdo bom guardado (guardar=True) ou só avisa que
     # não mudou (guardar=False, quem chama guarda os validadores).
+    # por_segundo: teto de requisições/s somando todas as threads. HTTP 429
+    # não é repetido: pausa todas as threads pelo Retry-After e falha o arquivo
+    # (último valor bom); insistir só prolonga o bloqueio do TSE.
 
-    def __init__(self, timeout=FEED_HTTP_TIMEOUT, tentativas=FEED_HTTP_TENTATIVAS):
+    def __init__(self, timeout=FEED_HTTP_TIMEOUT, tentativas=FEED_HTTP_TENTATIVAS, por_segundo=None):
         self.timeout = timeout
         self.tentativas = tentativas
+        self.intervalo = 1 / por_segundo if por_segundo else 0.0
         self.cache = {}  # url -> Resposta (último conteúdo bom)
         self._local = threading.local()
         self._trava = threading.Lock()
+        self._proxima_vez = 0.0  # time.monotonic() da próxima requisição liberada
+        self._pausa_ate = 0.0
         self.zerar_contadores()
 
     def zerar_contadores(self):
         self.requisicoes = 0
         self.nao_modificados = 0
+        self.limitadas = 0  # respostas 429
+
+    def _esperar_vez(self, url, prazo):
+        with self._trava:
+            vez = max(time.monotonic(), self._proxima_vez, self._pausa_ate)
+            if prazo is not None and vez > prazo - 1:
+                raise coletor.PrazoEsgotado(f"sem tempo para baixar {url}")
+            self._proxima_vez = vez + self.intervalo
+        espera = vez - time.monotonic()
+        if espera > 0:
+            time.sleep(espera)
+
+    def _pausar(self, cabecalhos_resposta):
+        try:
+            segundos = float(cabecalhos_resposta.get("Retry-After") or FEED_PAUSA_429)
+        except ValueError:  # Retry-After em formato de data
+            segundos = FEED_PAUSA_429
+        with self._trava:
+            self.limitadas += 1
+            self._pausa_ate = max(self._pausa_ate, time.monotonic() + min(max(segundos, 1), 30))
 
     def _contar(self, nao_modificado):
         with self._trava:
@@ -180,6 +212,7 @@ class ClienteTSE:
 
         ultimo_erro = None
         for tentativa in range(1, self.tentativas + 1):
+            self._esperar_vez(url, prazo)
             timeout = self.timeout
             if prazo is not None:
                 restante = prazo - time.monotonic()
@@ -216,7 +249,10 @@ class ClienteTSE:
                 return resposta
 
             erro = urllib.error.HTTPError(url, status, motivo, cabecalhos_resposta, io.BytesIO(corpo))
-            if status != 429 and status < 500:
+            if status == 429:
+                self._pausar(cabecalhos_resposta)
+                raise erro
+            if status < 500:
                 raise erro  # 404 e afins: não adianta tentar de novo
             ultimo_erro = erro
             if tentativa < self.tentativas:
@@ -731,6 +767,9 @@ class FeedMunicipios:
             atual, marcador = valores.get(cd), marcadores.get(cd)
             if atual is None or (marcador and marcador[0] != atual.get("m")) or (not marcador and not atual.get("f")):
                 pendentes.append((uf, cd))
+        # com o teto de requisições/s pode não caber tudo: primeiro quem nunca
+        # foi baixado (está zerado no arquivo), depois o que mudou
+        pendentes.sort(key=lambda pendente: pendente[1] in valores)
 
         # 2. municípios que mudaram (GET condicional com o ETag guardado)
         def municipio(pendente):
@@ -743,8 +782,12 @@ class FeedMunicipios:
                 return cd, None, erro
 
         falhas = []
+        adiados = 0
         for cd, resposta, erro in self.pool().map(municipio, pendentes):
             marcador = marcadores.get(cd)
+            if isinstance(erro, coletor.PrazoEsgotado):
+                adiados += 1  # não coube nesta execução: fica pendente para a próxima
+                continue
             if erro is not None:
                 falhas.append((cd, erro))
                 continue
@@ -795,7 +838,9 @@ class FeedMunicipios:
             "municipios": len(municipios),
             "pst": round(totalizadas / secoes, 6) if secoes else 0.0,
             "finalizados": sum(1 for v in valores.values() if v.get("f")),
-            "baixados": len(pendentes) - len(falhas),
+            "baixados": len(pendentes) - len(falhas) - adiados,
+            "adiados": adiados,
+            "limitadas_429": self.cliente.limitadas,
             "falhas": [cd for cd, _ in falhas],
             "motivos": sorted({coletor.descrever_erro(erro)[1] for _, erro in falhas}),
             "requisicoes": self.cliente.requisicoes,
@@ -820,10 +865,11 @@ class FeedMunicipios:
             logger.warning("Feed municípios: %d município(s) falharam — mantido o último valor bom",
                            len(resumo["falhas"]),
                            extra={"feed_falhas": resumo["falhas"][:50], "feed_motivos": resumo["motivos"]})
-        logger.info("Feed municípios gravado | seq %d | %d municípios | pst %.4f | %d baixados, %d req "
-                    "(%d sem mudança) | %d ms | %d MB",
-                    resumo["seq"], resumo["municipios"], resumo["pst"], resumo["baixados"], resumo["requisicoes"],
-                    resumo["nao_modificados"], resumo["duracao_ms"], resumo["memoria_mb"],
+        logger.info("Feed municípios gravado | seq %d | %d municípios | pst %.4f | %d baixados, %d adiados, "
+                    "%d req (%d sem mudança, %d com 429) | %d ms | %d MB",
+                    resumo["seq"], resumo["municipios"], resumo["pst"], resumo["baixados"], resumo["adiados"],
+                    resumo["requisicoes"], resumo["nao_modificados"], resumo["limitadas_429"],
+                    resumo["duracao_ms"], resumo["memoria_mb"],
                     extra={"feed_status": "municipios-gravado",
                            **{f"feed_{k}": v for k, v in resumo.items() if k not in ("falhas", "motivos")},
                            "feed_falhas_total": len(resumo["falhas"])})
@@ -883,7 +929,7 @@ def handler_municipios(event, context):
     # Lambda coletor-tse-feed-municipios: uma varredura por execução
     global _feed_municipios
     if _feed_municipios is None:
-        _feed_municipios = FeedMunicipios(DestinoS3(), ClienteTSE())
+        _feed_municipios = FeedMunicipios(DestinoS3(), ClienteTSE(por_segundo=FEED_MUN_REQ_POR_SEGUNDO))
     prazo = _prazo(context, 120)
     return _com_lock(context, FEED_MUN_LOCK_KEY, FEED_MUN_LOCK_TTL, "Feed municípios",
                      lambda: _feed_municipios.executar_com_log(prazo))

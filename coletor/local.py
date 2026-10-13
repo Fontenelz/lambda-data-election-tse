@@ -72,7 +72,8 @@ def main():
         return 1
 
     if not args.sem_brasil:
-        municipios = feed.FeedMunicipios(destino, feed.ClienteTSE(), config_direto)
+        municipios = feed.FeedMunicipios(destino, feed.ClienteTSE(por_segundo=feed.FEED_MUN_REQ_POR_SEGUNDO),
+                                         config_direto)
         resultado = municipios.executar_com_log(time.monotonic() + 600)
         print(json.dumps({"ciclo_municipios": resultado}, ensure_ascii=False, indent=2))
         if resultado["status"] != "gravado":
