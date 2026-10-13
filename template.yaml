@@ -10,10 +10,18 @@ Parameters:
     Description: Bucket existente (privado) onde o coletor grava. Não é gerenciado por este stack.
   TseBaseUrl:
     Type: String
-    Default: https://resultados-sim.tse.jus.br/simulado
+    Default: https://resultados.tse.jus.br
+    Description: Simulado = https://resultados-sim.tse.jus.br/simulado
   TseAmbiente:
     Type: String
-    Default: simulado2026
+    Default: oficial
+    Description: Simulado = simulado2026
+  TsePleito:
+    Type: String
+    Default: "3220"
+    Description: >-
+      Código(s) do pleito no ele-c.json, separados por vírgula (vazio = todos).
+      3220 = 1º turno de 04/10/2026; o 2º turno tem outro código. Simulado = 17801.
   TseTurno:
     Type: String
     Default: "1"
@@ -129,6 +137,7 @@ Resources:
           BUCKET_NAME: !Ref BucketName
           TSE_BASE_URL: !Ref TseBaseUrl
           TSE_AMBIENTE: !Ref TseAmbiente
+          TSE_PLEITO: !Ref TsePleito
           TSE_TURNO: !Ref TseTurno
           TSE_UF: !Ref TseUf
 

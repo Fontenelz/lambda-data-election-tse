@@ -30,9 +30,13 @@ logger = logging.getLogger()
 logger.setLevel(os.environ.get("LOG_LEVEL", "INFO"))
 
 # --- Configuração ---
-TSE_BASE_URL = os.environ.get("TSE_BASE_URL", "https://resultados-sim.tse.jus.br/simulado")
-AMBIENTE = os.environ.get("TSE_AMBIENTE", "simulado2026")
+TSE_BASE_URL = os.environ.get("TSE_BASE_URL", "https://resultados.tse.jus.br")
+AMBIENTE = os.environ.get("TSE_AMBIENTE", "oficial")
 TURNO = os.environ.get("TSE_TURNO", "1").strip()
+# códigos de pleito a coletar (separados por vírgula; vazio = todos). O
+# ele-c.json oficial traz também pleitos antigos e eleições suplementares
+# (ex.: governador de RR), que não podem entrar na coleta.
+PLEITOS = {p.strip() for p in os.environ.get("TSE_PLEITO", "3220").split(",") if p.strip()}
 UF = os.environ.get("TSE_UF", "ma").lower()
 
 BUCKET_NAME = os.environ["BUCKET_NAME"]
@@ -314,16 +318,21 @@ def obter_config(config_url, forcar=False, prazo=None):
 
 def listar_alvos(config):
     # Gera (pleito, eleicao, cargo, uf_pasta, abrangencia) para cada arquivo
-    # a coletar, filtrando pelo turno configurado.
+    # a coletar, filtrando pelo pleito e turno configurados.
     for pleito in config.get("pl", []):
+        if PLEITOS and str(pleito["cd"]) not in PLEITOS:
+            continue
         for eleicao in pleito.get("e", []):
             # str(): o TSE pode mandar o turno como número ou texto
             if str(eleicao.get("t", TURNO)) != TURNO:
                 continue
 
-            # na prática o índice sempre traz abr.cd = "br"; a pasta/UF é
-            # decidida pelo código do cargo
+            # nas eleições gerais o índice traz abr.cd = "br" e a pasta/UF é
+            # decidida pelo código do cargo; abrangência de outra UF (eleição
+            # suplementar, consulta popular) não é nossa
             for abrangencia in eleicao.get("abr", []):
+                if str(abrangencia.get("cd", "br")).lower() not in ("br", UF):
+                    continue
                 for cargo in abrangencia.get("cp", []):
                     if str(cargo["cd"]) in CARGOS_FEDERAIS:
                         yield pleito, eleicao, cargo, "br", "federal"
@@ -332,14 +341,15 @@ def listar_alvos(config):
                     # demais: cargo municipal ou exclusivo do DF - ainda não coberto
 
 
-def preparar_alvo(ciclo, pleito, eleicao, cargo, uf_pasta, cod_abrangencia):
+def preparar_alvo(pleito, eleicao, cargo, uf_pasta, cod_abrangencia):
     # (item do índice, url no TSE, rótulo para logs/alertas)
+    ciclo = pleito["c"]  # → "ele2026"; cada pleito tem o seu
     codigo_eleicao = str(eleicao["cd"])
     codigo_cargo = str(cargo["cd"])
     arquivo = f"{uf_pasta}-c{codigo_cargo.zfill(4)}-e{codigo_eleicao.zfill(6)}-u.json"
     url = f"{TSE_BASE_URL}/{AMBIENTE}/{ciclo}/{codigo_eleicao}/dados/{uf_pasta}/{arquivo}"
     item = {
-        "pleito": pleito["cd"],
+        "pleito": str(pleito["cd"]),
         "eleicao": codigo_eleicao,
         "nome_eleicao": eleicao.get("nm", ""),
         "cargo": codigo_cargo,
@@ -364,16 +374,18 @@ def coletar(prazo=None):
             logger.info("Configuração em cache sem eleição do turno %s — buscando no TSE", TURNO)
             config, fonte = obter_config(config_url, forcar=True, prazo=prazo)
             alvos = list(listar_alvos(config))
-        ciclo = config["pl"][0]["c"]  # → "ele2026"
+        ciclos = sorted({pleito["c"] for pleito, *_ in alvos})
     except Exception as error:
         tipo, motivo = descrever_erro(error)
         raise ColetaFalhou("configuração do TSE (ele-c.json)", tipo, f"{motivo} — {config_url}") from error
 
-    logger.info("Configuração (%s) | ciclo %s", fonte, ciclo)
+    logger.info("Configuração (%s) | pleito %s | ciclo %s",
+                fonte, ",".join(sorted(PLEITOS)) or "todos", ",".join(ciclos))
     if not alvos:
         raise ColetaFalhou(
             "configuração do TSE (ele-c.json)", "tse_nao_encontrado",
-            f"nenhuma eleição do turno {TURNO} com os cargos cobertos — confira TseTurno/TseAmbiente",
+            f"nenhuma eleição do pleito {','.join(sorted(PLEITOS)) or '(todos)'} / turno {TURNO} "
+            "com os cargos cobertos — confira TsePleito/TseTurno/TseAmbiente",
         )
 
     resultados_finais = []
@@ -383,7 +395,7 @@ def coletar(prazo=None):
 
     # 2. Baixa os cargos cobertos em paralelo (só a parte HTTP; S3 e índice
     # seguem em série, na ordem do ele-c.json)
-    preparados = [preparar_alvo(ciclo, *alvo) for alvo in alvos]
+    preparados = [preparar_alvo(*alvo) for alvo in alvos]
     for item, url, _ in preparados:
         logger.info("%s / %s (%s): %s", item["nome_eleicao"], item["nome_cargo"], item["abrangencia"], url)
     with ThreadPoolExecutor(max_workers=max(1, min(DOWNLOADS_PARALELOS, len(preparados)))) as pool:
@@ -467,7 +479,8 @@ def coletar(prazo=None):
 
 
 def lambda_handler(event, context):
-    logger.info("Iniciando coletor TSE | Ambiente: %s | Turno: %s | UF: %s", AMBIENTE, TURNO, UF.upper())
+    logger.info("Iniciando coletor TSE | Ambiente: %s | Pleito: %s | Turno: %s | UF: %s",
+                AMBIENTE, ",".join(sorted(PLEITOS)) or "todos", TURNO, UF.upper())
 
     dono = getattr(context, "aws_request_id", None) or str(uuid.uuid4())
     # instante-limite para parar de falar com o TSE, deixando a margem para

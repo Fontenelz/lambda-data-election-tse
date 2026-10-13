@@ -13,6 +13,7 @@ coletor = carregar("coletor", {
     "TSE_AMBIENTE": "simulado2026",
     "TSE_TURNO": "1",
     "TSE_UF": "ma",
+    "TSE_PLEITO": "",  # vazio = todos; o filtro por pleito tem testes próprios
 })
 
 BASE = "https://tse.teste/simulado/simulado2026/ele2026"
@@ -90,11 +91,40 @@ class ListarAlvos(unittest.TestCase):
 
     def test_preparar_alvo_com_codigos_numericos(self):
         alvos = list(coletor.listar_alvos(config_tse(como_numero=True)))
-        item, url, rotulo = coletor.preparar_alvo("ele2026", *alvos[1])
+        item, url, rotulo = coletor.preparar_alvo(*alvos[1])
         self.assertEqual(url, URL_GOVERNADOR)
         self.assertEqual(item["arquivo"], "simulado2026/ele2026/21272/dados/ma/ma-c0003-e021272-u.json")
         self.assertEqual((item["eleicao"], item["cargo"]), ("21272", "3"))
         self.assertEqual(rotulo, "Governador (MA)")
+
+
+    def test_filtra_pleito(self):
+        with mock.patch.object(coletor, "PLEITOS", {"3220"}):
+            self.assertEqual(self.cargos(config_tse()), [])
+        with mock.patch.object(coletor, "PLEITOS", {"1"}):
+            self.assertEqual(self.cargos(config_tse()), [("1", "br"), ("3", "ma"), ("5", "ma")])
+
+    def test_ignora_abrangencia_de_outra_uf(self):
+        # 2º turno de 2026: governador só em AM/RN/DF/ES/AC — MA não pode gerar alvo
+        config = {"pl": [{"cd": "3221", "c": "ele2026", "e": [
+            {"cd": "6260", "t": "2", "abr": [{"cd": uf, "cp": [{"cd": "3", "ds": "Governador"}]}
+                                             for uf in ("am", "rn", "df", "es", "ac")]},
+            {"cd": "6258", "t": "2", "abr": [{"cd": "br", "cp": [{"cd": "1", "ds": "Presidente"}]}]},
+        ]}]}
+        with mock.patch.object(coletor, "TURNO", "2"):
+            self.assertEqual(self.cargos(config), [("1", "br")])
+
+    def test_ciclo_vem_do_pleito_de_cada_eleicao(self):
+        # ele-c.json oficial lista pleitos de ele2024 antes dos de ele2026
+        config = {"pl": [
+            {"cd": "452", "c": "ele2024", "e": [{"cd": "619", "t": "1", "abr": [
+                {"cd": "br", "cp": [{"cd": "11", "ds": "Prefeito"}]}]}]},
+            {"cd": "3220", "c": "ele2026", "e": [{"cd": "6257", "t": "1", "abr": [
+                {"cd": "br", "cp": [{"cd": "1", "ds": "Presidente"}]}]}]},
+        ]}
+        item, url, _ = coletor.preparar_alvo(*next(coletor.listar_alvos(config)))
+        self.assertEqual(item["arquivo"], "simulado2026/ele2026/6257/dados/br/br-c0001-e006257-u.json")
+        self.assertIn("/ele2026/6257/", url)
 
 
 class BaixarJson(unittest.TestCase):

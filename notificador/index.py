@@ -77,8 +77,8 @@ DICAS_CLOUDFRONT = {
 DICAS = {
     "tse_indisponivel": "TSE lento ou fora do ar. Não precisa agir: o coletor tenta de novo a cada "
                         "execução e normaliza sozinho quando o TSE voltar.",
-    "tse_nao_encontrado": "O arquivo não existe no TSE. Confira os parâmetros TseAmbiente, TseBaseUrl "
-                          "e TseTurno (mudou para o ambiente oficial ou 2º turno?).",
+    "tse_nao_encontrado": "O arquivo não existe no TSE. Confira os parâmetros TseAmbiente, TseBaseUrl, "
+                          "TsePleito e TseTurno (mudou para o ambiente oficial ou 2º turno?).",
     "tse_conteudo_invalido": "O TSE devolveu arquivo incompleto ou em formato diferente. Se persistir, "
                              "o formato pode ter mudado e o coletor precisa de ajuste.",
     "s3": "Falha no S3. Verifique permissões e se o limite de gastos do projeto não foi atingido "
