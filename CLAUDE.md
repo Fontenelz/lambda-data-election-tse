@@ -60,6 +60,13 @@ O `~/.aws/config` tem `region = us-east-1` como padrão — sempre passar a regi
 
 Mais recente primeiro. Cada entrada: data, o quê, por quê, como foi verificado.
 
+- **2026-10-13 18:10 UTC** — **Implantado em teste do 2º turno**: `TsePleito=3221 TseTurno=2
+  TseEleicoes=6258,6260 FeedPrefixo=aovivo/teste/t2/` (código `deb725f`). O `dados_eleicao.json` no ar
+  passou a listar só o 2º turno. Fix `deb725f`: antes da 1ª totalização o TSE manda `dt`/`ht` vazios →
+  `fonte_atualizado` usa `dg`/`hg` (antes quebrava o ciclo rápido como `tse_conteudo_invalido`).
+  Verificado nos logs: espelho 6/6 sem falha; feed gravando a cada 15s (247 req, ~0,9s); municípios
+  5.571. Voltar ao 1º turno: `deploy.sh TsePleito=3220 TseTurno=1 TseEleicoes= FeedPrefixo=aovivo/teste/t1/`.
+
 - **2026-10-13** — Espelho coleta o governador do 2º turno (6260) em AM/RN/DF/ES/AC (commit `675b61a`):
   eleição listada em `TseEleicoes` aceita abrangência de outra UF (pasta da UF, abrangência
   `estadual-<uf>` no índice para não colidir). Sem `TseEleicoes`, como antes. Verificado: 93 testes OK;
